@@ -68,23 +68,6 @@ def main(config):
     # Set random seed for reproducibility
     np.random.seed(1)
 
-    # # Read input truth motion profile from CSV file
-    # print(f"\nReading input profile: {input_profile_name}")
-    # try:
-    #     # Simple CSV reading with numpy
-    #     # Assumes CSV has no header, 10 columns as specified in motion profile format
-    #     in_profile, no_epochs = read_profile(input_profile_name)
-    #     print(f"Successfully loaded {no_epochs} epochs")
-    #     print(f"Time span: {in_profile[0, 0]:.2f}s to {in_profile[-1, 0]:.2f}s")
-    #
-    # except FileNotFoundError:
-    #     print(f"Error: Could not find file '{input_profile_name}'")
-    #     print("Please ensure the input profile CSV file is in the current directory.")
-    #     return
-    # except Exception as e:
-    #     print(f"Error reading profile: {e}")
-    #     return
-
     data_path = config['data_path']
     real_data_trajectory_index = config['real_data_trajectory_index']
     gt_pd = pd.read_csv(os.path.join(data_path, f'simulated_data', f'GT_{real_data_trajectory_index}.csv'),
