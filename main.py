@@ -7,18 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
-from tqdm import tqdm
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import torch
-import random
-from torch import nn
-from torch import Tensor
-from typing import Type, Any, Callable, Union, List, Optional
-from sklearn.model_selection import train_test_split
-from math import cos, radians
 from lc_ins_dvl_real import lc_ins_dvl_real
-from read_profile import read_profile
 from plot_errors import plot_errors_with_std, plot_results
 
 
@@ -27,73 +16,6 @@ deg_to_rad = 0.01745329252
 rad_to_deg = 1 / deg_to_rad
 micro_g_to_meters_per_second_squared = 9.80665e-6
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Input truth motion profile filename
-input_profile_name = 'Profile_1.csv'
-# Output motion profile and error filenames
-output_profile_name = 'INS_GNSS_Demo_3_Profile.csv'
-output_errors_name = 'INS_GNSS_Demo_3_Errors.csv'
-
-# ============================================================================
-# INITIALIZATION ERRORS
-# ============================================================================
-
-initialization_errors = {
-    # Attitude initialization error (deg, converted to rad; @N,E,D)
-    'delta_eul_nb_n': np.array([-0.0, 0.0, 0.0]) * deg_to_rad,  # rad
-    # Position and velocity errors (set to zero if not specified)
-    'delta_r_eb_n': np.array([0.0, 0.0, 0.0]),  # m
-    'delta_v_eb_n': np.array([0.0, 0.0, 0.0])   # m/s
-}
-
-# ============================================================================
-# IMU ERRORS
-# ============================================================================
-
-IMU_errors = {
-    # Accelerometer biases (micro-g, converted to m/s^2; body axes)
-    'b_a': np.array([900, -1300, 800]) * micro_g_to_meters_per_second_squared,
-
-    # Gyro biases (deg/hour, converted to rad/sec; body axes)
-    'b_g': np.array([-9, 13, -8]) * deg_to_rad / 3600,
-
-    # Accelerometer scale factor and cross coupling errors (ppm, converted to unitless; body axes)
-    'M_a': np.array([
-        [500, -300, 200],
-        [-150, -600, 250],
-        [-250, 100, 450]
-    ]) * 1e-6,
-
-    # Gyro scale factor and cross coupling errors (ppm, converted to unitless; body axes)
-    'M_g': np.array([
-        [400, -300, 250],
-        [0, -300, -150],
-        [0, 0, -350]
-    ]) * 1e-6,
-
-    # Gyro g-dependent biases (deg/hour/g, converted to rad-sec/m; body axes)
-    'G_g': np.array([
-        [0.9, -1.1, -0.6],
-        [-0.5, 1.9, -1.6],
-        [0.3, 1.1, -1.3]
-    ]) * deg_to_rad / (3600 * 9.80665),
-
-    # Accelerometer noise root PSD (micro-g per root Hz, converted to m s^-1.5)
-    'accel_noise_root_PSD': 100 * micro_g_to_meters_per_second_squared,
-
-    # Gyro noise root PSD (deg per root hour, converted to rad s^-0.5)
-    'gyro_noise_root_PSD': 0.01 * deg_to_rad / 60,
-
-    # Accelerometer quantization level (m/s^2)
-    'accel_quant_level': 1e-2,
-
-    # Gyro quantization level (rad/s)
-    'gyro_quant_level': 2e-4
-}
 
 # ============================================================================
 # DVL CONFIG
@@ -108,54 +30,6 @@ DVL_config = {
 # ============================================================================
 
 LC_KF_config = {
-    # # Initial attitude uncertainty per axis (deg, converted to rad)
-    # 'init_att_unc': np.deg2rad(np.sqrt(5)),
-    #
-    # # Initial velocity uncertainty per axis (m/s)
-    # 'init_vel_unc': np.sqrt(0.2),
-    #
-    # # Initial position uncertainty per axis (m)
-    # 'init_pos_unc': np.sqrt(20),
-    #
-    # # Initial accelerometer bias uncertainty per instrument (micro-g, converted to m/s^2)
-    # 'init_b_a_unc': np.sqrt(30000) * micro_g_to_meters_per_second_squared,
-    #
-    # # Initial gyro bias uncertainty per instrument (deg/hour, converted to rad/sec)
-    # 'init_b_g_unc': np.sqrt(30) * deg_to_rad / 3600,
-
-    # # Initial attitude uncertainty per axis (deg, converted to rad)
-    # 'init_att_unc': np.deg2rad(5),
-    #
-    # # Initial velocity uncertainty per axis (m/s)
-    # 'init_vel_unc': 0.2,
-    #
-    # # Initial position uncertainty per axis (m)
-    # 'init_pos_unc': 20,
-    #
-    # # Initial accelerometer bias uncertainty per instrument (micro-g, converted to m/s^2)
-    # 'init_b_a_unc': 1000 * micro_g_to_meters_per_second_squared,
-    #
-    # # Initial gyro bias uncertainty per instrument (deg/hour, converted to rad/sec)
-    # 'init_b_g_unc': 10 * deg_to_rad / 3600,
-    #
-    # # Gyro noise PSD (deg^2 per hour, converted to rad^2/s)
-    # 'gyro_noise_PSD': (0.02 * deg_to_rad / 60) ** 2,
-    #
-    # # Accelerometer noise PSD (micro-g^2 per Hz, converted to m^2 s^-3)
-    # 'accel_noise_PSD': (200 * micro_g_to_meters_per_second_squared) ** 2,
-    #
-    # # Accelerometer bias random walk PSD (m^2 s^-5)
-    # 'accel_bias_PSD': 1.0e-7,
-    #
-    # # Gyro bias random walk PSD (rad^2 s^-3)
-    # 'gyro_bias_PSD': 2.0e-12,
-    #
-    # # Position measurement noise SD per axis (m)
-    # 'pos_meas_SD': 2.5,
-    #
-    # # Velocity measurement noise SD per axis (m/s)
-    # 'vel_meas_SD': 0.5
-
 
     # Initial attitude uncertainty per axis (deg, converted to rad)
     'init_att_unc': np.deg2rad(0.1),
@@ -171,18 +45,6 @@ LC_KF_config = {
 
     # Initial gyro bias uncertainty per instrument (deg/hour, converted to rad/sec)
     'init_b_g_unc': 0.001 * deg_to_rad / 3600,
-
-    # # Gyro noise PSD (deg^2 per hour, converted to rad^2/s)
-    # 'gyro_noise_PSD': (1.0 * deg_to_rad / 60) ** 2,
-    #
-    # # Accelerometer noise PSD (micro-g^2 per Hz, converted to m^2 s^-3)
-    # 'accel_noise_PSD': (100 * micro_g_to_meters_per_second_squared) ** 2,
-    #
-    # # Accelerometer bias random walk PSD (m^2 s^-5)
-    # 'accel_bias_PSD': 1.0e-7,
-    #
-    # # Gyro bias random walk PSD (rad^2 s^-3)
-    # 'gyro_bias_PSD': 2.0e-12,
 
     # Moderate process noise (despite zero in simulation)
     'gyro_noise_PSD': (0.5 * deg_to_rad / 60) ** 2,
@@ -247,11 +109,8 @@ def main(config):
         in_dvl_profile,
         in_gt_profile,
         no_epochs,
-        initialization_errors,
-        IMU_errors,
         DVL_config,
         LC_KF_config,
-        config
     )
 
 

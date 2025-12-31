@@ -34,11 +34,8 @@ def lc_ins_dvl_real(
         in_dvl_profile: np.ndarray,
         in_gt_profile: np.ndarray,
         no_epochs: int,
-        initialization_errors: Dict[str, np.ndarray],
-        imu_errors: Dict[str, Any],
         dvl_config: Dict[str, Any],
         lc_kf_config: Dict[str, float],
-        config: Dict[str, str]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
