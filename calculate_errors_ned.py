@@ -8,13 +8,13 @@ Inputs:
   est_h_b       height solution (m)
   est_v_eb_n    velocity solution of body frame w.r.t. ECEF frame,
                 resolved along north, east, and down (m/s)
-  est_C_b_n     body-to-NED coordinate transformation matrix solution
+  est_C_b_to_n     body-to-NED coordinate transformation matrix solution
   true_L_b      true latitude (rad)
   true_lambda_b true longitude (rad)
   true_h_b      true height (m)
   true_v_eb_n   true velocity of body frame w.r.t. ECEF frame, resolved
                 along north, east, and down (m/s)
-  true_C_b_n    true body-to-NED coordinate transformation matrix
+  true_C_b_to_n    true body-to-NED coordinate transformation matrix
 
 Outputs:
   delta_r_eb_n     position error resolved along NED (m)
@@ -35,12 +35,12 @@ def calculate_errors_ned(
         est_lambda_b: float,
         est_h_b: float,
         est_v_eb_n: np.ndarray,
-        est_C_b_n: np.ndarray,
+        est_C_b_to_n: np.ndarray,
         true_L_b: float,
         true_lambda_b: float,
         true_h_b: float,
         true_v_eb_n: np.ndarray,
-        true_C_b_n: np.ndarray
+        true_C_b_to_n: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate the position, velocity, and attitude errors of a NED navigation solution.
@@ -56,7 +56,7 @@ def calculate_errors_ned(
     est_v_eb_n : np.ndarray
         Velocity solution of body frame w.r.t. ECEF frame,
         resolved along north, east, and down (m/s), shape (3,)
-    est_C_b_n : np.ndarray
+    est_C_b_to_n : np.ndarray
         Body-to-NED coordinate transformation matrix solution, shape (3, 3)
     true_L_b : float
         True latitude (rad)
@@ -67,7 +67,7 @@ def calculate_errors_ned(
     true_v_eb_n : np.ndarray
         True velocity of body frame w.r.t. ECEF frame, resolved
         along north, east, and down (m/s), shape (3,)
-    true_C_b_n : np.ndarray
+    true_C_b_to_n : np.ndarray
         True body-to-NED coordinate transformation matrix, shape (3, 3)
 
     Returns
@@ -95,8 +95,8 @@ def calculate_errors_ned(
     delta_v_eb_n = est_v_eb_n - true_v_eb_n
 
     # Attitude error calculation, using (5.109) and (5.111)
-    delta_C_b_n = est_C_b_n @ true_C_b_n.T
-    delta_eul_nb_n = -ctm_to_euler(delta_C_b_n)
+    delta_C_b_to_n = est_C_b_to_n @ true_C_b_to_n.T
+    delta_eul_nb_n = -ctm_to_euler(delta_C_b_to_n) #Note that maybe we want to show delta_eul_bn_n instead
 
     # Ends
 

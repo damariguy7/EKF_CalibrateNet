@@ -157,8 +157,6 @@ def P_predict(
 
     Phi_matrix[3:6, 9:12] = est_C_b_n_old * tor_s
 
-
-
     # Position error propagation
 
     # F_32 * tor_s
@@ -178,12 +176,12 @@ def P_predict(
     G_k = G_k_update(est_C_b_n_old)
 
     Q_prime_matrix = np.zeros((12, 12))
-    Q_prime_matrix[0:3, 0:3] = np.eye(3) * lc_kf_config['gyro_noise_PSD'] * tor_s
-    Q_prime_matrix[3:6, 3:6] = np.eye(3) * lc_kf_config['accel_noise_PSD'] * tor_s
-    Q_prime_matrix[6:9, 6:9] = np.eye(3) * lc_kf_config['accel_bias_PSD'] * tor_s
-    Q_prime_matrix[9:12, 9:12] = np.eye(3) * lc_kf_config['gyro_bias_PSD'] * tor_s
+    Q_prime_matrix[0:3, 0:3] = np.eye(3) * lc_kf_config['gyro_noise_PSD']
+    Q_prime_matrix[3:6, 3:6] = np.eye(3) * lc_kf_config['accel_noise_PSD']
+    Q_prime_matrix[6:9, 6:9] = np.eye(3) * lc_kf_config['accel_bias_PSD']
+    Q_prime_matrix[9:12, 9:12] = np.eye(3) * lc_kf_config['gyro_bias_PSD']
 
-    Q_k = G_k @ Q_prime_matrix @ G_k.T
+    Q_k = G_k @ Q_prime_matrix @ G_k.T * tor_s
 
     P_matrix_new = predict(Phi_matrix, P_matrix_old, Q_k).copy()
 
@@ -205,13 +203,19 @@ def G_k_update(rotation_matrix):
     zeros_3x3 = np.zeros((3, 3))
     identity_3x3 = np.eye(3)
 
-    G_top = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    G_mid1 = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    G_mid2 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    G_top = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    G_mid1 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    G_mid2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
     G_bot1 = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
     G_bot2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
+    # G_top = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    # G_mid1 = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    # G_mid2 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    # G_bot1 = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
+    # G_bot2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
 
-    return np.concatenate([G_mid2, G_mid1,G_top, G_bot1, G_bot2], axis=0)
+    # return np.concatenate([G_mid2, G_mid1, G_top, G_bot1, G_bot2], axis=0)
+    return np.concatenate([G_top, G_mid1, G_mid2, G_bot1, G_bot2], axis=0)
 
 
 def predict(phi, P, Q):

@@ -5,7 +5,7 @@ Date: December 15, 2025
 Description:
 Loosely Coupled Kalman Filter Epoch Update
 
-Implements one cycle of the loosely coupled INS/GNSS Kalman filter
+Implements one cycle of the loosely coupled INS/DVL Kalman filter
 plus closed-loop correction of all inertial states.
 
 """
@@ -19,9 +19,9 @@ from ctm_to_euler import ctm_to_euler
 
 
 def lc_ekf_epoch(
-        dvl_v_eb_n: np.ndarray,
+        dvl_v_eb_b: np.ndarray,
         tor_s: float,
-        est_C_b_n_old: np.ndarray,
+        est_C_b_to_n_old: np.ndarray,
         est_v_eb_n_old: np.ndarray,
         est_L_b_old: float,
         est_lambda_b_old: float,
@@ -43,12 +43,12 @@ def lc_ekf_epoch(
         DVL estimated NED velocity (m/s), shape (3,)
     tor_s : float
         Propagation interval (s)
-    est_C_b_e_old : np.ndarray
-        Prior estimated body to ECEF coordinate transformation matrix, shape (3, 3)
+    est_C_b_to_n_old : np.ndarray
+        Prior estimated body to NED coordinate transformation matrix, shape (3, 3)
     est_v_eb_e_old : np.ndarray
-        Prior estimated ECEF user velocity (m/s), shape (3,)
+        Prior estimated NED user velocity (m/s), shape (3,)
     est_r_eb_e_old : np.ndarray
-        Prior estimated ECEF user position (m), shape (3,)
+        Prior estimated NED user position (m), shape (3,)
     est_imu_bias_old : np.ndarray
         Prior estimated IMU biases (body axes), shape (6,)
         Rows 0-2: accelerometer biases (m/s^2)
@@ -71,11 +71,11 @@ def lc_ekf_epoch(
     Returns
     -------
     est_C_b_e_new : np.ndarray
-        Updated estimated body to ECEF coordinate transformation matrix, shape (3, 3)
+        Updated estimated body to NED coordinate transformation matrix, shape (3, 3)
     est_v_eb_e_new : np.ndarray
-        Updated estimated ECEF user velocity (m/s), shape (3,)
+        Updated estimated NED user velocity (m/s), shape (3,)
     est_r_eb_e_new : np.ndarray
-        Updated estimated ECEF user position (m), shape (3,)
+        Updated estimated NED user position (m), shape (3,)
     est_imu_bias_new : np.ndarray
         Updated estimated IMU biases, shape (6,)
         Rows 0-2: estimated accelerometer biases (m/s^2)
@@ -91,7 +91,7 @@ def lc_ekf_epoch(
     # e = 0.0818191908425  # WGS84 eccentricity
     #
     # # # Euler angles from body to NED, in the order roll, pitch, yaw (rad)
-    # # euler_b_n = ctm_to_euler(est_C_b_n_old)
+    # # euler_b_n = ctm_to_euler(est_C_b_to_n_old)
     # #
     # # roll = float(euler_b_n[0])
     #
@@ -140,13 +140,13 @@ def lc_ekf_epoch(
     #     [omega_ie * np.cos(est_L_b_old) + est_v_eb_n_E_old/((R_E + est_h_b_old) * np.cos(est_L_b_old)**2), 0 , -est_v_eb_n_E_old*np.tan(est_L_b_old)/((R_E + est_h_b_old)**2)]
     # ]) * tor_s
     #
-    # Phi_matrix[0:3, 12:15] = est_C_b_n_old * tor_s
+    # Phi_matrix[0:3, 12:15] = est_C_b_to_n_old * tor_s
     #
     #
     #
     # # Velocity error propagation
     # # F_21  * tor_s
-    # Phi_matrix[3:6, 0:3] = - skew_symmetric(est_C_b_n_old@meas_f_ib_b) * tor_s
+    # Phi_matrix[3:6, 0:3] = - skew_symmetric(est_C_b_to_n_old@meas_f_ib_b) * tor_s
     #
     # # I_3 + F_22 * tor_s
     # Phi_matrix[3:6, 3:6] = Phi_matrix[3:6, 3:6] + np.array([
@@ -171,7 +171,7 @@ def lc_ekf_epoch(
     #     [2*est_v_eb_n_D_old*omega_ie*np.sin(est_L_b_old), 0, (est_v_eb_n_E_old**2)/(R_E + est_h_b_old)**2 + (est_v_eb_n_N_old**2)/(R_N + est_h_b_old)**2 - 2*g_0/geocentric_radius]
     # ]) * tor_s
     #
-    # Phi_matrix[3:6, 9:12] = est_C_b_n_old * tor_s
+    # Phi_matrix[3:6, 9:12] = est_C_b_to_n_old * tor_s
     #
     #
     #
@@ -219,10 +219,10 @@ def lc_ekf_epoch(
 
     # 5. Set-up measurement matrix using (14.115)
     H_matrix = np.zeros((3, 15))
-    # H_matrix[0:3, 0:3] = est_C_b_n_old
-    # H_matrix[0:3, 3:6] = -est_C_b_n_old @ skew_symmetric(est_v_eb_n_old)
-    H_matrix[0:3, 0:3] = -est_C_b_n_old.T @ skew_symmetric(est_v_eb_n_old)
-    H_matrix[0:3, 3:6] = est_C_b_n_old.T
+    # H_matrix[0:3, 0:3] = est_C_b_to_n_old
+    # H_matrix[0:3, 3:6] = -est_C_b_to_n_old @ skew_symmetric(est_v_eb_n_old)
+    H_matrix[0:3, 0:3] = -est_C_b_to_n_old.T @ skew_symmetric(est_v_eb_n_old)
+    H_matrix[0:3, 3:6] = est_C_b_to_n_old.T
 
 
 
@@ -250,8 +250,8 @@ def lc_ekf_epoch(
     # 8. Formulate measurement innovations using (14.102)
     # Note: zero lever arm is assumed here
     delta_z = np.zeros(3)
-    # delta_z[0:3] = gnss_r_eb_e - est_r_eb_e_old
-    delta_z[0:3] = est_C_b_n_old.T @ est_v_eb_n_old - dvl_v_eb_n
+
+    delta_z[0:3] = est_C_b_to_n_old.T @ est_v_eb_n_old - dvl_v_eb_b
 
     # 9. Update state estimates using (3.24)
     x_est_new = x_est_propagated + K_matrix @ delta_z
@@ -278,7 +278,7 @@ def lc_ekf_epoch(
     # ========================================================================
 
     # Correct attitude, velocity, and position using (14.7-9)
-    est_C_b_n_new = (np.eye(3) - skew_symmetric(x_est_new[0:3])) @ est_C_b_n_old
+    est_C_b_n_new = (np.eye(3) - skew_symmetric(x_est_new[0:3])) @ est_C_b_to_n_old
     est_v_eb_n_new = est_v_eb_n_old - x_est_new[3:6]
 
 

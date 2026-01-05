@@ -36,7 +36,7 @@ def lc_ins_dvl_real(
         no_epochs: int,
         dvl_config: Dict[str, Any],
         lc_kf_config: Dict[str, float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
 
@@ -87,18 +87,7 @@ def lc_ins_dvl_real(
     out_kf_sd : np.ndarray
         Output Kalman filter state uncertainties
     """
-    # data_path = config['data_path']
-    # real_data_trajectory_index = config['real_data_trajectory_index']
-    # gt_pd = pd.read_csv(os.path.join(data_path, f'real_data', f'GT_trajectory{real_data_trajectory_index}.csv'),
-    #                     header=0, names=None)
-    # imu_pd = pd.read_csv(os.path.join(data_path, f'real_data', f'IMU_trajectory{real_data_trajectory_index}.csv'),
-    #                      header=0, names=None)
-    # dvl_pd = pd.read_csv(os.path.join(data_path, f'real_data', f'DVL_trajectory{real_data_trajectory_index}.csv'),
-    #                      header=0, names=None)
-    #
-    # in_gt_profile = np.array(gt_pd.iloc[:, 0:10])
-    # in_imu_profile = np.array(imu_pd.iloc[:, 0:7])
-    # in_dvl_profile = np.array(dvl_pd.iloc[:, 0:4])
+
 
     # Initialize true navigation solution
     old_time = in_gt_profile[0, 0]
@@ -170,7 +159,7 @@ def lc_ins_dvl_real(
     out_profile[0, 2] = old_est_lambda_b
     out_profile[0, 3] = old_est_h_b
     out_profile[0, 4:7] = old_est_v_eb_n
-    out_profile[0, 7:10] = ctm_to_euler(old_est_C_b_n)  ## transpose ot not?
+    out_profile[0, 7:10] = ctm_to_euler(old_est_C_b_n)
 
     # # Determine errors and generate output record
     delta_r_eb_n, delta_v_eb_n, delta_eul_nb_n = calculate_errors_ned(
@@ -187,8 +176,8 @@ def lc_ins_dvl_real(
     P_matrix = initialize_lc_p_matrix(lc_kf_config)
     est_imu_bias = np.zeros(6)
 
-    # Initialize IMU quantization residuals
-    quant_residuals = np.zeros(6)
+    # # Initialize IMU quantization residuals
+    # quant_residuals = np.zeros(6)
 
     # Determine number of DVL epochs
     num_dvl_epochs = int(np.ceil((in_dvl_profile[-1, 0] - old_time) /
@@ -209,7 +198,7 @@ def lc_ins_dvl_real(
     for i in range(15):
         out_kf_sd[0, i + 1] = np.sqrt(P_matrix[i, i])
 
-    # Initialize GNSS model timing
+    # Initialize DVL model timing
     time_last_dvl = old_time
     dvl_epoch = 0
 
@@ -228,11 +217,11 @@ def lc_ins_dvl_real(
 
         # Input data from motion profile
         time = in_imu_profile[epoch, 0]
-        true_L_b = in_gt_profile[epoch, 1]
-        true_lambda_b = in_gt_profile[epoch, 2]
-        true_h_b = in_gt_profile[epoch, 3]
-        true_v_eb_b = in_gt_profile[epoch, 4:7].copy()
-        true_eul_nb = in_gt_profile[epoch, 7:10].copy()
+        true_L_b = in_gt_profile[dvl_epoch, 1]
+        true_lambda_b = in_gt_profile[dvl_epoch, 2]
+        true_h_b = in_gt_profile[dvl_epoch, 3]
+        true_v_eb_b = in_gt_profile[dvl_epoch, 4:7].copy()
+        true_eul_nb = in_gt_profile[dvl_epoch, 7:10].copy()
         true_C_b_n = euler_to_ctm(true_eul_nb)
         true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_nb)
 
@@ -244,8 +233,6 @@ def lc_ins_dvl_real(
         tor_i = time - old_time
 
 
-        # meas_f_ib_b = in_imu_profile[epoch, 1:4]
-        # meas_omega_ib_b = in_imu_profile[epoch, 4:7]
         meas_f_ib_b = in_imu_profile[epoch, 1:4] - old_est_b_a
         meas_omega_ib_b = in_imu_profile[epoch, 4:7] - old_est_b_g
 
@@ -326,9 +313,6 @@ def lc_ins_dvl_real(
 
         # Reset old values
         old_time = time
-        # old_true_r_eb_e = true_r_eb_e.copy()
-        # old_true_v_eb_e = true_v_eb_e.copy()
-        # old_true_C_b_e = true_C_b_e.copy()
         old_est_L_b = est_L_b
         old_est_lambda_b = est_L_b
         old_est_h_b = est_h_b
