@@ -39,29 +39,29 @@ LC_KF_config = {
     'init_vel_unc': 0.2,
 
     # Initial position uncertainty per axis (m)
-    'init_pos_unc': 0.1,
+    'init_pos_unc': 0.01,
 
     # Initial accelerometer bias uncertainty per instrument (micro-g, converted to m/s^2)
     'init_b_a_unc': 10 * micro_g_to_meters_per_second_squared,
 
     # Initial gyro bias uncertainty per instrument (deg/hour, converted to rad/sec)
-    'init_b_g_unc': 0.001 * deg_to_rad / 3600,
+    'init_b_g_unc': 0.01 * deg_to_rad / 3600,
 
     # Moderate process noise (despite zero in simulation)
     'gyro_noise_PSD': (0.005 * deg_to_rad / 60) ** 2,
-    'accel_noise_PSD': (0.1 * micro_g_to_meters_per_second_squared) ** 2,
+    'accel_noise_PSD': (0.01 * micro_g_to_meters_per_second_squared) ** 2,
 
     # Accelerometer bias random walk PSD (m^2 s^-5)
-    'accel_bias_PSD': 1.0e-4,
+    'accel_bias_PSD': 1.0e-8,
 
     # Gyro bias random walk PSD (rad^2 s^-3)
-    'gyro_bias_PSD': 2.0e-6,
+    'gyro_bias_PSD': 2.0e-9,
 
     # # Position measurement noise SD per axis (m)
     # 'pos_meas_SD': 0.5,
 
     # Velocity measurement noise SD per axis (m/s)
-    'vel_meas_SD': 0.05
+    'vel_meas_SD': 0.5
 }
 
 

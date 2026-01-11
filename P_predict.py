@@ -9,6 +9,7 @@ Implements one cycle of the loosely coupled INS/GNSS Kalman filter
 plus closed-loop correction of all inertial states.
 
 """
+from math import atan2, asin
 
 import numpy as np
 from typing import Dict
@@ -82,6 +83,8 @@ def P_predict(
     est_v_eb_n_N_old = est_v_eb_n_old[0]
     est_v_eb_n_E_old = est_v_eb_n_old[1]
     est_v_eb_n_D_old = est_v_eb_n_old[2]
+
+    est_pos_old = np.array([est_L_b_old, est_lambda_b_old, est_h_b_old])
 
     # Calculate radii of curvature
     R_N, R_E = radii_of_curvature(est_L_b_old)
@@ -173,13 +176,21 @@ def P_predict(
         [0, 0, 0]
     ]) * tor_s
 
+    # F = F_system_matrix(est_pos_old, est_v_eb_n_old, est_C_b_n_old,meas_f_ib_b)
+    # Phi_matrix = np.eye(15) + F * tor_s
+
     G_k = G_k_update(est_C_b_n_old)
 
     Q_prime_matrix = np.zeros((12, 12))
-    Q_prime_matrix[0:3, 0:3] = np.eye(3) * lc_kf_config['gyro_noise_PSD']
-    Q_prime_matrix[3:6, 3:6] = np.eye(3) * lc_kf_config['accel_noise_PSD']
+    Q_prime_matrix[0:3, 0:3] = np.eye(3) * lc_kf_config['accel_noise_PSD']
+    Q_prime_matrix[3:6, 3:6] = np.eye(3) * lc_kf_config['gyro_noise_PSD']
     Q_prime_matrix[6:9, 6:9] = np.eye(3) * lc_kf_config['accel_bias_PSD']
     Q_prime_matrix[9:12, 9:12] = np.eye(3) * lc_kf_config['gyro_bias_PSD']
+    # Q_prime_matrix = np.zeros((12, 12))
+    # Q_prime_matrix[0:3, 0:3] = np.eye(3) * lc_kf_config['gyro_noise_PSD']
+    # Q_prime_matrix[3:6, 3:6] = np.eye(3) * lc_kf_config['accel_noise_PSD']
+    # Q_prime_matrix[6:9, 6:9] = np.eye(3) * lc_kf_config['accel_bias_PSD']
+    # Q_prime_matrix[9:12, 9:12] = np.eye(3) * lc_kf_config['gyro_bias_PSD']
 
     Q_k = G_k @ Q_prime_matrix @ G_k.T * tor_s
 
@@ -203,19 +214,109 @@ def G_k_update(rotation_matrix):
     zeros_3x3 = np.zeros((3, 3))
     identity_3x3 = np.eye(3)
 
-    G_top = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    G_mid1 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
-    G_mid2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    G_bot1 = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
-    G_bot2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
-    # G_top = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    # G_mid1 = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
-    # G_mid2 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    G_att = np.concatenate([zeros_3x3,rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    G_vel = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    G_pos = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    G_ba = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
+    G_bg = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
+    # G_top = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    # G_mid1 = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    # G_mid2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
     # G_bot1 = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
     # G_bot2 = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
+    # G_pos = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    # G_vel = np.concatenate([zeros_3x3, rotation_matrix, zeros_3x3, zeros_3x3], axis=1)
+    # G_att = np.concatenate([rotation_matrix, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    # G_ba = np.concatenate([zeros_3x3, zeros_3x3, identity_3x3, zeros_3x3], axis=1)
+    # G_bg = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, identity_3x3], axis=1)
 
     # return np.concatenate([G_mid2, G_mid1, G_top, G_bot1, G_bot2], axis=0)
-    return np.concatenate([G_top, G_mid1, G_mid2, G_bot1, G_bot2], axis=0)
+    # return np.concatenate([G_pos, G_vel, G_att, G_ba, G_bg], axis=0)
+    return np.concatenate([G_att, G_vel, G_pos, G_ba, G_bg], axis=0)
+
+def F_system_matrix(location, velocity, rotation_matrix, acceleration):
+    """
+    Continuous-time error-state system matrix F (15x15).
+
+    Args:
+        location (np.ndarray): [lat, lon, alt].
+        velocity (np.ndarray): NED velocity [m/s], size (3,).
+        rotation_matrix (np.ndarray): C_bn (3x3).
+        acceleration (np.ndarray): Specific force [m/s^2], size (3,).
+
+    Returns:
+        np.ndarray: F (15x15).
+    """
+    w_ie = 7.292115e-5
+    e = 0.0818191908426
+    latitude = location[0]
+    altitude = location[2]
+    v_north, v_east, v_down = velocity
+
+    R_eS_e = np.sqrt((R_E(latitude) * np.cos(latitude)) ** 2 +
+                     ((1 - e * 2) * R_E(latitude) * np.sin(latitude)) * 2)
+    zeros_3x3 = np.zeros((3, 3))
+
+    F_EE = -vec2skew(w_ie_n(location) + w_en_n(location, velocity))
+    F_Ev = np.array([[0, -1 / (R_E(latitude) + altitude), 0],
+                     [1 / (R_N(latitude) + altitude), 0, 0],
+                     [0, np.tan(latitude) / (R_E(latitude) + altitude), 0]])
+    F_Ep = np.array([
+        [w_ie * np.sin(latitude), 0, v_east / (R_E(latitude) + altitude) ** 2],
+        [0, 0, -v_north / (R_N(latitude) + altitude) ** 2],
+        [w_ie * np.cos(latitude) + v_east / ((R_E(latitude) + altitude) * np.cos(latitude) ** 2),
+         0,
+         (-v_east * np.tan(latitude)) / (R_E(latitude) + altitude) ** 2]
+    ])
+    F_vE = -vec2skew(rotation_matrix @ acceleration)
+    F_vv = np.array([
+        [v_down / (R_N(latitude) + altitude),
+         -2 * v_east * np.tan(latitude) / (R_E(latitude) + altitude) - 2 * w_ie * np.sin(latitude),
+         v_north / (R_N(latitude) + altitude)],
+        [2 * w_ie * np.sin(latitude) + v_east * np.tan(latitude) / (R_E(latitude) + altitude),
+         (v_north * np.tan(latitude) + v_down) / (R_E(latitude) + altitude),
+         v_east / (R_E(latitude) + altitude) + 2 * w_ie * np.cos(latitude)],
+        [-2 * v_north / (R_N(latitude) + altitude),
+         -2 * v_east / (R_E(latitude) + altitude) - 2 * w_ie * np.cos(latitude),
+         0
+         ]
+    ])
+    sec_lat = 1 / np.cos(latitude)
+    F_vp = np.array([
+        [-v_east * 2 * sec_lat * 2 / (R_E(latitude) + altitude) - 2 * v_east * w_ie * np.cos(latitude),
+         0,
+         v_east * 2 * np.tan(latitude) / (R_E(latitude) + altitude) * 2 - v_north * v_down / (
+                 R_N(latitude) + altitude) ** 2],
+        [v_north * v_east * sec_lat ** 2 / (R_E(latitude) + altitude) +
+         2 * v_north * w_ie * np.cos(latitude) - 2 * v_down * w_ie * np.sin(latitude),
+         0,
+         -(v_north * v_east * np.tan(latitude) + v_east * v_down) / (R_E(latitude) + altitude) ** 2],
+        [2 * v_east * w_ie * np.sin(latitude),
+         0,
+         v_east * 2 / (R_E(latitude) + altitude) * 2 +
+         v_north * 2 / (R_N(latitude) + altitude) * 2 -
+         2 * standard_gravity(location) / R_eS_e]
+    ])
+    F_pv = np.array([
+        [1 / (R_N(latitude) + altitude), 0, 0],
+        [0, 1 / ((R_E(latitude) + altitude) * np.cos(latitude)), 0],
+        [0, 0, -1]
+    ])
+    F_pp = np.array([
+        [0, 0, -v_north / (R_N(latitude) + altitude) ** 2],
+        [v_east * np.sin(latitude) / ((R_E(latitude) + altitude) * np.cos(latitude) ** 2),
+         0,
+         v_east / ((R_E(latitude) + altitude) ** 2 * np.cos(latitude))],
+        [0, 0, 0]
+    ])
+
+    F_top = np.concatenate([F_pp, F_pv, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+    F_mid1 = np.concatenate([F_vp, F_vv, F_vE, rotation_matrix, zeros_3x3], axis=1)
+    F_mid2 = np.concatenate([F_Ep, F_Ev, F_EE, zeros_3x3, rotation_matrix], axis=1)
+    F_bot = np.concatenate([zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3, zeros_3x3], axis=1)
+
+    F = np.concatenate([F_top, F_mid1, F_mid2, F_bot, F_bot], axis=0)
+    return F
 
 
 def predict(phi, P, Q):
@@ -232,3 +333,177 @@ def predict(phi, P, Q):
     """
     P_pred = phi @ P @ phi.T + Q
     return (P_pred + P_pred.T) / 2
+
+
+# ----------------------------------------------------------
+# Rotation and orientation utilities
+# ----------------------------------------------------------
+def Rbn(roll, pitch, yaw):
+    """
+    Compute body-to-NED rotation matrix from Euler angles.
+
+    Args:
+        roll (float): Roll angle [rad].
+        pitch (float): Pitch angle [rad].
+        yaw (float): Yaw angle [rad].
+
+    Returns:
+        np.ndarray: 3x3 body-to-NED rotation matrix.
+    """
+    tmp1 = np.array([[np.cos(yaw), np.sin(yaw), 0],
+                     [-np.sin(yaw), np.cos(yaw), 0],
+                     [0, 0, 1]])
+    tmp2 = np.array([[np.cos(pitch), 0, -np.sin(pitch)],
+                     [0, 1, 0],
+                     [np.sin(pitch), 0, np.cos(pitch)]])
+    tmp3 = np.array([[1, 0, 0],
+                     [0, np.cos(roll), np.sin(roll)],
+                     [0, -np.sin(roll), np.cos(roll)]])
+    return (tmp3 @ tmp2 @ tmp1).T
+
+def vec2skew(vector):
+    """
+    Convert a vector into a skew-symmetric matrix.
+
+    Args:
+        vector (np.ndarray): 3-element vector.
+
+    Returns:
+        np.ndarray: 3x3 skew-symmetric matrix.
+    """
+    a1, a2, a3 = vector.flatten()
+    return np.array([[0, -a3, a2],
+                     [a3, 0, -a1],
+                     [-a2, a1, 0]])
+
+def rotation_to_euler(R):
+    """
+    Convert a rotation matrix to Euler angles.
+
+    Args:
+        R (np.ndarray): 3x3 rotation matrix.
+
+    Returns:
+        np.ndarray: [roll, pitch, yaw] in radians.
+    """
+    roll = atan2(R[2, 1], R[2, 2])
+    pitch = -asin(R[2, 0])
+    yaw = atan2(R[1, 0], R[0, 0])
+    return np.array([roll, pitch, yaw])
+
+# ----------------------------------------------------------
+# Earth & gravity models (WGS-84)
+# ----------------------------------------------------------
+def g_ned(lla):
+    """
+    Normal gravity on WGS-84 ellipsoid.
+
+    Args:
+        lla (np.ndarray): [lat, lon, alt].
+
+    Returns:
+        float: Gravity magnitude [m/s^2].
+    """
+    latitude_rad = lla[0]
+    gamma_e = 9.7803267715
+    k = 0.001931851353
+    e_sq = 0.00669438002290
+    sin_phi = np.sin(latitude_rad)
+    # return gamma_e * (1 + k * sin_phi * 2) / np.sqrt(1 - e_sq * sin_phi * 2)
+    return 9.8106
+
+def standard_gravity(location):
+    """
+    Standard gravity model (Groves p.47).
+
+    Args:
+        location (np.ndarray): [lat, lon, alt].
+
+    Returns:
+        float: Gravity [m/s^2].
+    """
+    latitude = location[0]
+    eccentricity = 0.0818191908426
+    # return 9.7803253359 * (
+    #         1 + (0.001931853 * np.power(sin(latitude), 2)) /
+    #         np.sqrt(1 - np.power(eccentricity * sin(latitude), 2))
+    # )
+
+    return 9.8106
+
+def R_N(latitude):
+    """
+    Meridian radius of curvature.
+
+    Args:
+        latitude (float): Latitude [rad].
+
+    Returns:
+        float: Radius [m].
+    """
+    R = 6378137
+    e = 0.0818191908426
+    return (R * (1 - e * 2)) / (1 - (e * 2) * np.sin(latitude) * 2) * (3 / 2)
+
+def R_E(latitude):
+    """
+    Prime vertical radius of curvature.
+
+    Args:
+        latitude (float): Latitude [rad].
+
+    Returns:
+        float: Radius [m].
+    """
+    R = 6378137
+    e = 0.0818191908426
+    return R / np.sqrt(1 - (e * 2) * np.sin(latitude) * 2)
+
+def w_en_n(lla, v_ned):
+    """
+    Transport rate (motion-induced rotation in NED).
+
+    Args:
+        lla (np.ndarray): [lat, lon, alt].
+        v_ned (np.ndarray): Velocity in NED [m/s].
+
+    Returns:
+        np.ndarray: [rad/s] 3-vector.
+    """
+    vN, vE = v_ned[0], v_ned[1]
+    latitude, altitude = lla[0], lla[2]
+    return np.array([
+        vE / (R_E(latitude) + altitude),
+        -vN * np.tan(latitude) / (R_N(latitude) + altitude),
+        -vE / (R_E(latitude) + altitude)
+    ])
+
+def w_ie_n(lla):
+    """
+    Earth rotation rate in NED.
+
+    Args:
+        lla (np.ndarray): [lat, lon, alt].
+
+    Returns:
+        np.ndarray: [rad/s] 3-vector.
+    """
+    Sigma = 7.292115e-5
+    latitude = lla[0]
+    return np.array([Sigma * np.cos(latitude), 0, -Sigma * np.sin(latitude)])
+
+def w_nb_b(w_ib_b, lla, v_ned, C_bn):
+    """
+    Body angular rate wrt navigation frame (expressed in body frame).
+
+    Args:
+        w_ib_b (np.ndarray): Gyro measurement [rad/s].
+        lla (np.ndarray): [lat, lon, alt].
+        v_ned (np.ndarray): Velocity in NED [m/s].
+        C_bn (np.ndarray): Body-to-NED rotation matrix.
+
+    Returns:
+        np.ndarray: [rad/s] 3-vector.
+    """
+    C_nb = C_bn.T
+    return w_ib_b.flatten() - C_nb @ (w_ie_n(lla) + w_en_n(lla, v_ned))

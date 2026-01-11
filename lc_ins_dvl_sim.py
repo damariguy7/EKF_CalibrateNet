@@ -133,8 +133,8 @@ def lc_ins_dvl_sim(
     old_est_h_b = true_h_b
     old_est_v_eb_n = true_v_eb_n
     old_est_C_b_to_n = true_C_b_to_n
-    old_est_b_a = np.ones(3)
-    old_est_b_g = np.ones(3)
+    old_est_b_a = np.zeros(3)
+    old_est_b_g = np.zeros(3)
 
 
     # Initialize output arrays
@@ -271,8 +271,8 @@ def lc_ins_dvl_sim(
             )
 
             # Generate IMU bias and clock output records
-            out_imu_bias_est[epoch, 0] = time
-            out_imu_bias_est[epoch, 1:7] = est_imu_bias
+            # out_imu_bias_est[epoch, 0] = time
+            # out_imu_bias_est[epoch, 1:7] = est_imu_bias
             # out_clock[gnss_epoch, 0] = time
             # out_clock[gnss_epoch, 1:3] = est_clock
 
@@ -289,6 +289,9 @@ def lc_ins_dvl_sim(
         out_profile[epoch, 3] = est_h_b
         out_profile[epoch, 4:7] = est_v_eb_n
         out_profile[epoch, 7:10] = ctm_to_euler(est_C_b_to_n.T)
+
+        out_imu_bias_est[epoch, 0] = time
+        out_imu_bias_est[epoch, 1:7] = est_imu_bias
 
         # Determine errors and generate output record
         delta_r_eb_n, delta_v_eb_n, delta_eul_nb_n = calculate_errors_ned(
@@ -308,7 +311,7 @@ def lc_ins_dvl_sim(
         # old_true_v_eb_e = true_v_eb_e.copy()
         # old_true_C_b_e = true_C_b_e.copy()
         old_est_L_b = est_L_b
-        old_est_lambda_b = est_L_b
+        old_est_lambda_b = est_lambda_b
         old_est_h_b = est_h_b
         old_est_v_eb_n = est_v_eb_n.copy()
         old_est_C_b_to_n = est_C_b_to_n.copy()
@@ -324,6 +327,3 @@ def lc_ins_dvl_sim(
     # out_kf_sd = out_kf_sd[:no_epochs + 1, :]
 
     return out_profile, out_errors, out_imu_bias_est, out_kf_sd
-
-
-
