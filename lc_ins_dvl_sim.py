@@ -17,6 +17,10 @@ import os
 import pandas as pd
 from typing import Tuple, Dict, Any
 import sys
+import navpy
+
+from matplotlib import pyplot as plt
+
 from lc_ekf_epoch import lc_ekf_epoch
 from euler_to_ctm import euler_to_ctm
 from initialize_ned_attitude import initialize_ned_attitude
@@ -27,6 +31,7 @@ from kinematics_ned import kinematics_ned
 from nav_equations_ned import nav_equations_ned
 from body_to_ned import body_to_ned
 from P_predict import P_predict
+from skew_symmetric import skew_symmetric
 
 
 def lc_ins_dvl_sim(
@@ -87,59 +92,48 @@ def lc_ins_dvl_sim(
     true_C_b_to_n = euler_to_ctm(true_eul_n_to_b).T
     true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_n_to_b)
 
-    # old_true_r_eb_e, old_true_v_eb_e, old_true_C_b_e = ned_to_ecef(
-    #     true_L_b, true_lambda_b, true_h_b, true_v_eb_n, true_C_b_to_n
-    # )
+    # Initialize Kalman filter P matrix and IMU bias states
+    P_matrix = initialize_lc_p_matrix(lc_kf_config)
+    est_imu_bias = np.zeros(6)
 
-    # # Determine satellite positions and velocities
-    # sat_r_es_e, sat_v_es_e = satellite_positions_and_velocities(
-    #     old_time, gnss_config
-    # )
-    #
-    # # Initialize GNSS biases
-    # gnss_biases = initialize_gnss_biases(
-    #     sat_r_es_e, old_true_r_eb_e, true_L_b, true_lambda_b, gnss_config
-    # )
+    # Generate KF uncertainty record
+    out_kf_sd = np.zeros((no_epochs, 16))
+    out_kf_sd[0, 0] = old_time
+    for i in range(15):
+        out_kf_sd[0, i + 1] = np.sqrt(P_matrix[i, i])
 
-    # # Generate GNSS measurements
-    # gnss_measurements, no_gnss_meas = generate_gnss_measurements(
-    #     old_time, sat_r_es_e, sat_v_es_e, old_true_r_eb_e,
-    #     true_L_b, true_lambda_b, old_true_v_eb_e, gnss_biases, gnss_config
-    # )
+    P_diag = np.diag(P_matrix)
+    std_devs = np.sqrt(P_diag)
 
-    # # Determine Least-squares GNSS position solution
-    # gnss_r_eb_e, gnss_v_eb_e, est_clock = gnss_ls_position_velocity(
-    #     gnss_measurements, no_gnss_meas, gnss_config['init_est_r_ea_e'],
-    #     np.array([0, 0, 0])
-    # )
-    #
-    # old_est_r_eb_e = gnss_r_eb_e.copy()
-    # old_est_v_eb_e = gnss_v_eb_e.copy()
-    #
-    # old_est_L_b, old_est_lambda_b, old_est_h_b, old_est_v_eb_n = pv_ecef_to_ned(
-    #     old_est_r_eb_e, old_est_v_eb_e
-    # )
-    # est_L_b = old_est_L_b
+    # Step 2: Generate initial errors (50% of std with random sign)
+    np.random.seed(42)  # For reproducibility (change or remove for different errors each run)
+    initial_errors = np.zeros(15)
 
-    # Initialize estimated attitude solution
+    for i in range(15):
+        sign = np.random.choice([-1, 1])  # Random positive or negative
+        initial_errors[i] = sign * 0.5 * std_devs[i]  # 50% of standard deviation
 
-    # _, _, old_est_C_b_e = ned_to_ecef(
-    #     old_est_L_b, old_est_lambda_b, old_est_h_b,
-    #     old_est_v_eb_n, old_est_C_b_to_n
-    # )
 
-    old_est_L_b = true_L_b
-    old_est_lambda_b = true_lambda_b
-    old_est_h_b = true_h_b
-    old_est_v_eb_n = true_v_eb_n
-    old_est_C_b_to_n = true_C_b_to_n
-    old_est_b_a = np.zeros(3)
-    old_est_b_g = np.zeros(3)
+    old_est_L_b = true_L_b - initial_errors[6]
+    old_est_lambda_b = true_lambda_b - initial_errors[7]
+    old_est_h_b = true_h_b - initial_errors[8]
+    old_est_v_eb_n = true_v_eb_n + initial_errors[3:6]
+    delta_psi_skew = skew_symmetric(initial_errors[0:3])
+    old_est_C_b_to_n = (np.eye(3) + delta_psi_skew) @ true_C_b_to_n
+
+    # CRITICAL: Re-orthonormalize to ensure it's a valid rotation matrix
+    U, _, Vt = np.linalg.svd(old_est_C_b_to_n)
+    old_est_C_b_to_n = U @ Vt
+
+    # Bias errors (simple addition)
+    old_est_b_a = initial_errors[9:12].copy()
+    old_est_b_g = initial_errors[12:15].copy()
 
 
     # Initialize output arrays
     out_profile = np.zeros((no_epochs, 10))
     out_errors = np.zeros((no_epochs, 10))
+
 
     # Generate initial output profile record
     out_profile[0, 0] = old_time
@@ -160,9 +154,6 @@ def lc_ins_dvl_sim(
     out_errors[0, 4:7] = delta_v_eb_n
     out_errors[0, 7:10] = delta_eul_nb_n
 
-    # Initialize Kalman filter P matrix and IMU bias states
-    P_matrix = initialize_lc_p_matrix(lc_kf_config)
-    est_imu_bias = np.zeros(6)
 
     # Initialize IMU quantization residuals
     quant_residuals = np.zeros(6)
@@ -170,6 +161,8 @@ def lc_ins_dvl_sim(
     # Determine number of DVL epochs
     num_dvl_epochs = int(np.ceil((in_dvl_profile[-1, 0] - old_time) /
                                  dvl_config['epoch_interval'])) + 1
+
+    time_dvl = np.zeros(num_dvl_epochs)
 
     # Generate IMU bias and clock output records
     out_imu_bias_est = np.zeros((no_epochs, 7))
@@ -180,11 +173,6 @@ def lc_ins_dvl_sim(
     # out_clock[0, 0] = old_time
     # out_clock[0, 1:3] = est_clock
 
-    # Generate KF uncertainty record
-    out_kf_sd = np.zeros((no_epochs, 16))
-    out_kf_sd[0, 0] = old_time
-    for i in range(15):
-        out_kf_sd[0, i + 1] = np.sqrt(P_matrix[i, i])
 
     # Initialize DVL model timing
     time_last_dvl = old_time
@@ -234,6 +222,9 @@ def lc_ins_dvl_sim(
         for i in range(15):
             out_kf_sd[epoch, i + 1] = np.sqrt(P_matrix[i, i])
 
+        P_diag = np.diag(P_matrix)
+        std_devs = np.sqrt(P_diag)
+
 
         # Update estimated navigation solution
         est_L_b, est_lambda_b, est_h_b, est_v_eb_n, est_C_b_to_n = nav_equations_ned(
@@ -246,13 +237,14 @@ def lc_ins_dvl_sim(
             dvl_epoch += 1
             tor_s = time - time_last_dvl
             time_last_dvl = time
+            time_dvl[dvl_epoch] = time_last_dvl
 
             # Input data from motion profile
-            true_L_b = in_gt_profile[dvl_epoch, 1]
-            true_lambda_b = in_gt_profile[dvl_epoch, 2]
-            true_h_b = in_gt_profile[dvl_epoch, 3]
-            true_v_eb_b = in_gt_profile[dvl_epoch, 4:7].copy()
-            true_eul_n_to_b = in_gt_profile[dvl_epoch, 7:10].copy()
+            true_L_b = in_gt_profile[epoch, 1]
+            true_lambda_b = in_gt_profile[epoch, 2]
+            true_h_b = in_gt_profile[epoch, 3]
+            true_v_eb_b = in_gt_profile[epoch, 4:7].copy()
+            true_eul_n_to_b = in_gt_profile[epoch, 7:10].copy()
             true_C_b_to_n = euler_to_ctm(true_eul_n_to_b).T
             true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_n_to_b)
 
@@ -281,6 +273,11 @@ def lc_ins_dvl_sim(
             for i in range(15):
                 out_kf_sd[epoch, i + 1] = np.sqrt(P_matrix[i, i])
 
+            P_diag = np.diag(P_matrix)
+            std_devs = np.sqrt(P_diag)
+
+        if(time>2000):
+            print("breakpoint")
 
         # Generate output profile record
         out_profile[epoch, 0] = time
@@ -326,4 +323,112 @@ def lc_ins_dvl_sim(
     # # out_clock = out_clock[:gnss_epoch + 1, :]
     # out_kf_sd = out_kf_sd[:no_epochs + 1, :]
 
+    # fig_3d = plot_3d_trajectory(in_gt_profile, out_profile)
+
     return out_profile, out_errors, out_imu_bias_est, out_kf_sd
+
+
+def plot_3d_trajectory(in_gt_profile, out_profile):
+    """
+    Plot 3D trajectory comparing ground truth and estimated navigation solutions.
+
+    Parameters
+    ----------
+    in_gt_profile : np.ndarray
+        Ground truth profile array (no_epochs x 10)
+    out_profile : np.ndarray
+        Estimated navigation solution profile array (no_epochs x 10)
+    """
+
+    from mpl_toolkits.mplot3d import Axes3D
+
+    # Extract ground truth data
+    gt_lat = np.rad2deg(in_gt_profile[:, 1])  # latitude (convert rad to deg for navpy)
+    gt_lon = np.rad2deg(in_gt_profile[:, 2])  # longitude (convert rad to deg for navpy)
+    gt_h = in_gt_profile[:, 3]  # height (m)
+
+    # Extract estimated data
+    est_lat = np.rad2deg(out_profile[:, 1])  # latitude (convert rad to deg for navpy)
+    est_lon = np.rad2deg(out_profile[:, 2])  # longitude (convert rad to deg for navpy)
+    est_h = out_profile[:, 3]  # height (m)
+
+    # Debug: Print some values to verify data
+    print(f"\nGT - First position: lat={gt_lat[0]:.6f}°, lon={gt_lon[0]:.6f}°, h={gt_h[0]:.3f}m")
+    print(f"EST - First position: lat={est_lat[0]:.6f}°, lon={est_lon[0]:.6f}°, h={est_h[0]:.3f}m")
+    print(f"GT - Last position: lat={gt_lat[-1]:.6f}°, lon={gt_lon[-1]:.6f}°, h={gt_h[-1]:.3f}m")
+    print(f"EST - Last position: lat={est_lat[-1]:.6f}°, lon={est_lon[-1]:.6f}°, h={est_h[-1]:.3f}m")
+
+    # Use first GT position as reference point
+    lat_ref = gt_lat[0]
+    lon_ref = gt_lon[0]
+    h_ref = gt_h[0]
+
+    # Convert GT trajectory to NED coordinates using navpy
+    gt_ned = np.array([navpy.lla2ned(gt_lat[i], gt_lon[i], gt_h[i],
+                                     lat_ref, lon_ref, h_ref)
+                       for i in range(len(gt_lat))])
+    gt_north = gt_ned[:, 0]
+    gt_east = gt_ned[:, 1]
+    gt_down = gt_ned[:, 2]
+
+    # Convert estimated trajectory to NED coordinates using navpy
+    est_ned = np.array([navpy.lla2ned(est_lat[i], est_lon[i], est_h[i],
+                                      lat_ref, lon_ref, h_ref)
+                        for i in range(len(est_lat))])
+    est_north = est_ned[:, 0]
+    est_east = est_ned[:, 1]
+    est_down = est_ned[:, 2]
+
+    # Debug: Print converted coordinates
+    print(f"\nGT North range: [{gt_north.min():.3f}, {gt_north.max():.3f}] m")
+    print(f"EST North range: [{est_north.min():.3f}, {est_north.max():.3f}] m")
+    print(f"GT East range: [{gt_east.min():.3f}, {gt_east.max():.3f}] m")
+    print(f"EST East range: [{est_east.min():.3f}, {est_east.max():.3f}] m")
+    print(f"GT Down range: [{gt_down.min():.3f}, {gt_down.max():.3f}] m")
+    print(f"EST Down range: [{est_down.min():.3f}, {est_down.max():.3f}] m")
+
+    # Create 3D plot
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot ground truth trajectory
+    ax.plot(gt_north, gt_east, gt_down,
+            'b-', linewidth=2.5, label='Ground Truth', alpha=0.8)
+
+    # Plot estimated trajectory
+    ax.plot(est_north, est_east, est_down,
+            'r--', linewidth=2, label='Estimated', alpha=0.8)
+
+    # Mark start and end points
+    ax.scatter(gt_north[0], gt_east[0], gt_down[0],
+               c='green', s=150, marker='o', label='Start', zorder=5,
+               edgecolors='black', linewidths=2)
+    ax.scatter(gt_north[-1], gt_east[-1], gt_down[-1],
+               c='red', s=150, marker='s', label='End (GT)', zorder=5,
+               edgecolors='black', linewidths=2)
+    ax.scatter(est_north[-1], est_east[-1], est_down[-1],
+               c='orange', s=150, marker='^', label='End (EST)', zorder=5,
+               edgecolors='black', linewidths=2)
+
+    # Labels and formatting
+    ax.set_xlabel('North (m)', fontsize=12, labelpad=10, fontweight='bold')
+    ax.set_ylabel('East (m)', fontsize=12, labelpad=10, fontweight='bold')
+    ax.set_zlabel('Down (m)', fontsize=12, labelpad=10, fontweight='bold')
+    ax.set_title('3D Trajectory: Ground Truth vs Estimated',
+                 fontsize=16, fontweight='bold', pad=20)
+
+    # Invert z-axis to show depth correctly
+    ax.invert_zaxis()
+
+    # Legend
+    ax.legend(loc='best', fontsize=11, framealpha=0.9)
+
+    # Grid
+    ax.grid(True, alpha=0.3)
+
+    # Set viewing angle
+    ax.view_init(elev=25, azim=45)
+
+    plt.tight_layout()
+
+    return fig

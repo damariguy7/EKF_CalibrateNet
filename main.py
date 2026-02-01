@@ -36,7 +36,7 @@ LC_KF_config = {
     'init_att_unc': np.deg2rad(0.1),
 
     # Initial velocity uncertainty per axis (m/s)
-    'init_vel_unc': 0.2,
+    'init_vel_unc': 2.0,
 
     # Initial position uncertainty per axis (m)
     'init_pos_unc': 0.01,
@@ -49,13 +49,13 @@ LC_KF_config = {
 
     # Moderate process noise (despite zero in simulation)
     'gyro_noise_PSD': (0.005 * deg_to_rad / 60) ** 2,
-    'accel_noise_PSD': (0.01 * micro_g_to_meters_per_second_squared) ** 2,
+    'accel_noise_PSD': (0.001 * micro_g_to_meters_per_second_squared) ** 2,
 
     # Accelerometer bias random walk PSD (m^2 s^-5)
     'accel_bias_PSD': 1.0e-8,
 
     # Gyro bias random walk PSD (rad^2 s^-3)
-    'gyro_bias_PSD': 2.0e-9,
+    'gyro_bias_PSD': 2.0e-10,
 
     # # Position measurement noise SD per axis (m)
     # 'pos_meas_SD': 0.5,
@@ -148,7 +148,7 @@ if __name__ == '__main__':
     user_config = {
         'data_path': "C:\\Users\\damar\\PycharmProjects\\EKF_CalibrateNet",
         'data_type': 'sim',  # "sim" or "real"
-        'simulated_data_file_name': 'static',
+        'simulated_data_file_name': 'straight', #'static', 'straight'
         'real_data_trajectory_index': '1',  # 1-13
         'train_model': False,
         'test_model': False,
