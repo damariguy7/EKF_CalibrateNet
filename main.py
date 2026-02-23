@@ -48,20 +48,20 @@ LC_KF_config = {
     'init_b_g_unc': 10 * deg_to_rad / 3600,
 
     # Moderate process noise (despite zero in simulation)
-    'gyro_noise_PSD': (0.05 * deg_to_rad / 60) ** 2,
+    'gyro_noise_PSD': (0.1 * deg_to_rad / 60) ** 2,
     'accel_noise_PSD': (1.0 * micro_g_to_meters_per_second_squared) ** 2,
 
     # Accelerometer bias random walk PSD (m^2 s^-5)
-    'accel_bias_PSD': 1.0e-7,
+    'accel_bias_PSD': 1.0e-2,
 
     # Gyro bias random walk PSD (rad^2 s^-3)
-    'gyro_bias_PSD': 2.0e-10,
+    'gyro_bias_PSD': 2.0e-8,
 
     # # Position measurement noise SD per axis (m)
     # 'pos_meas_SD': 0.5,
 
     # Velocity measurement noise SD per axis (m/s)
-    'vel_meas_SD': 2.0
+    'vel_meas_SD': 5.0
 }
 
 
