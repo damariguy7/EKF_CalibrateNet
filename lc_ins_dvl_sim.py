@@ -32,6 +32,7 @@ from nav_equations_ned import nav_equations_ned
 from body_to_ned import body_to_ned
 from P_predict import P_predict
 from skew_symmetric import skew_symmetric
+from radii_of_curvature import radii_of_curvature
 
 
 def lc_ins_dvl_sim(
@@ -41,7 +42,9 @@ def lc_ins_dvl_sim(
         no_epochs: int,
         dvl_config: Dict[str, Any],
         lc_kf_config: Dict[str, float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        collect_data: bool = False,
+        compensator=None,
+) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
 
@@ -87,10 +90,9 @@ def lc_ins_dvl_sim(
     true_L_b = in_gt_profile[0, 1]
     true_lambda_b = in_gt_profile[0, 2]
     true_h_b = in_gt_profile[0, 3]
-    true_v_eb_b = in_gt_profile[0, 4:7].copy()
     true_eul_n_to_b = in_gt_profile[0, 7:10].copy()
     true_C_b_to_n = euler_to_ctm(true_eul_n_to_b).T
-    true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_n_to_b)
+    true_v_eb_n = in_gt_profile[0, 4:7].copy()
 
     # Initialize Kalman filter P matrix and IMU bias states
     P_matrix = initialize_lc_p_matrix(lc_kf_config)
@@ -114,8 +116,10 @@ def lc_ins_dvl_sim(
         initial_errors[i] = sign * 0.5 * std_devs[i]  # 50% of standard deviation
 
 
-    old_est_L_b = true_L_b - initial_errors[6]
-    old_est_lambda_b = true_lambda_b - initial_errors[7]
+    # Convert initial position errors from meters to radians for lat/lon
+    R_N_init, R_E_init = radii_of_curvature(true_L_b)
+    old_est_L_b = true_L_b - initial_errors[6] / R_N_init
+    old_est_lambda_b = true_lambda_b - initial_errors[7] / ((R_E_init + true_h_b) * np.cos(true_L_b) + 1e-10)
     old_est_h_b = true_h_b - initial_errors[8]
     old_est_v_eb_n = true_v_eb_n + initial_errors[3:6]
     delta_psi_skew = skew_symmetric(initial_errors[0:3])
@@ -128,6 +132,7 @@ def lc_ins_dvl_sim(
     # Bias errors (simple addition)
     old_est_b_a = initial_errors[9:12].copy()
     old_est_b_g = initial_errors[12:15].copy()
+    est_imu_bias = initial_errors[9:15].copy()  # KF bias estimate must match initial perturbation
 
 
     # Initialize output arrays
@@ -178,6 +183,10 @@ def lc_ins_dvl_sim(
     time_last_dvl = old_time
     dvl_epoch = 0
 
+    # DNN data collection buffers (filled at every DVL epoch)
+    dvl_features_list = [] if collect_data else None
+    dvl_labels_list   = [] if collect_data else None
+
     # Progress bar
     print('Processing: ', end='', flush=True)
     progress_mark = 0
@@ -196,10 +205,9 @@ def lc_ins_dvl_sim(
         true_L_b = in_gt_profile[epoch, 1]
         true_lambda_b = in_gt_profile[epoch, 2]
         true_h_b = in_gt_profile[epoch, 3]
-        true_v_eb_b = in_gt_profile[epoch, 4:7].copy()
         true_eul_n_to_b = in_gt_profile[epoch, 7:10].copy()
         true_C_b_to_n = euler_to_ctm(true_eul_n_to_b).T
-        true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_n_to_b)
+        true_v_eb_n = in_gt_profile[epoch, 4:7].copy()
 
         # true_r_eb_e, true_v_eb_e, true_C_b_e = ned_to_ecef(
         #     true_L_b, true_lambda_b, true_h_b, true_v_eb_n, true_C_b_to_n
@@ -243,24 +251,37 @@ def lc_ins_dvl_sim(
             true_L_b = in_gt_profile[epoch, 1]
             true_lambda_b = in_gt_profile[epoch, 2]
             true_h_b = in_gt_profile[epoch, 3]
-            true_v_eb_b = in_gt_profile[epoch, 4:7].copy()
             true_eul_n_to_b = in_gt_profile[epoch, 7:10].copy()
             true_C_b_to_n = euler_to_ctm(true_eul_n_to_b).T
-            true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_n_to_b)
+            true_v_eb_n = in_gt_profile[epoch, 4:7].copy()
 
 
             dvl_v_eb_b = in_dvl_profile[dvl_epoch, 1:4]
 
-
-            # print("dvl_epoch:", dvl_epoch)  #for debug
-            # if(dvl_epoch == 10):
-            #     print("breakpoint debug")  # for debug
+            # --- DNN: capture pre-update features ---
+            C_nb_pre     = est_C_b_to_n.T
+            innovation   = C_nb_pre @ est_v_eb_n - dvl_v_eb_b
+            v_ekf_pre    = est_v_eb_n.copy()
+            euler_pre    = ctm_to_euler(C_nb_pre)
 
             # Run Integration Kalman filter
             est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
                 dvl_v_eb_b, tor_s, est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
                 meas_f_ib_b, meas_omega_ib_b, lc_kf_config
             )
+
+            # --- DNN: apply velocity compensation (inference mode) ---
+            if compensator is not None:
+                correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
+                if correction is not None:
+                    est_v_eb_n = est_v_eb_n + correction
+
+            # --- DNN: store training sample (collect_data mode) ---
+            if collect_data:
+                feat  = np.concatenate([innovation, dvl_v_eb_b, v_ekf_pre, euler_pre])
+                label = true_v_eb_n - est_v_eb_n          # remaining error after EKF update
+                dvl_features_list.append(feat)
+                dvl_labels_list.append(label)
 
             # Generate IMU bias and clock output records
             # out_imu_bias_est[epoch, 0] = time
@@ -324,6 +345,11 @@ def lc_ins_dvl_sim(
     # out_kf_sd = out_kf_sd[:no_epochs + 1, :]
 
     # fig_3d = plot_3d_trajectory(in_gt_profile, out_profile)
+
+    if collect_data:
+        dvl_features = np.array(dvl_features_list)   # (N_dvl, 12)
+        dvl_labels   = np.array(dvl_labels_list)     # (N_dvl,  3)
+        return out_profile, out_errors, out_imu_bias_est, out_kf_sd, dvl_features, dvl_labels
 
     return out_profile, out_errors, out_imu_bias_est, out_kf_sd
 

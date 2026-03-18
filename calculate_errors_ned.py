@@ -83,13 +83,12 @@ def calculate_errors_ned(
 
     # Begins
 
-    # Position error calculation, using (2.119)
-    # R_N, R_E = radii_of_curvature(true_L_b)
+    # Position error calculation, using (2.119) - convert lat/lon difference to meters
+    R_N, R_E = radii_of_curvature(true_L_b)
     delta_r_eb_n = np.zeros(3)
-    delta_r_eb_n[0] = (est_L_b - true_L_b)
-    delta_r_eb_n[1] = (est_lambda_b - true_lambda_b)
-    #
-    delta_r_eb_n[2] = est_h_b - true_h_b
+    delta_r_eb_n[0] = (est_L_b - true_L_b) * R_N                                     # North (m)
+    delta_r_eb_n[1] = (est_lambda_b - true_lambda_b) * (R_E + true_h_b) * np.cos(true_L_b)  # East (m)
+    delta_r_eb_n[2] = est_h_b - true_h_b                                              # Down (m)
 
     # Velocity error calculation
     delta_v_eb_n = est_v_eb_n - true_v_eb_n

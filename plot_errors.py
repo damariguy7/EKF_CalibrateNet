@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import navpy
 
 
 def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
@@ -296,3 +297,59 @@ def plot_results(out_errors, out_KF_SD):
     # plt.savefig('INS_GNSS_Demo_3_Results.png', dpi=300, bbox_inches='tight')
     # print("Plot saved as: INS_GNSS_Demo_3_Results.png")
     # plt.show()
+
+
+def plot_trajectory_2d(in_gt_profile, out_errors):
+    """
+    Plot 2D top-down GT and EKF-estimated trajectory (North vs East).
+
+    Parameters
+    ----------
+    in_gt_profile : np.ndarray
+        Ground truth profile (cols: time, lat_rad, lon_rad, h, ...)
+    out_errors : np.ndarray
+        Navigation errors (cols: time, pos_N_err, pos_E_err, pos_D_err, ...)
+        pos error = estimated - true, so estimated = true + error
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    lat_ref = np.rad2deg(in_gt_profile[0, 1])
+    lon_ref = np.rad2deg(in_gt_profile[0, 2])
+    h_ref   = in_gt_profile[0, 3]
+
+    gt_ned = np.array([
+        navpy.lla2ned(
+            np.rad2deg(in_gt_profile[i, 1]),
+            np.rad2deg(in_gt_profile[i, 2]),
+            in_gt_profile[i, 3],
+            lat_ref, lon_ref, h_ref
+        )
+        for i in range(len(in_gt_profile))
+    ])
+    gt_n, gt_e = gt_ned[:, 0], gt_ned[:, 1]
+
+    # Estimated trajectory: GT position + position error
+    # out_errors[:, 1] = est_N - true_N, out_errors[:, 2] = est_E - true_E
+    # Subtract initial error so both trajectories share the same starting point
+    est_n = gt_n + out_errors[:, 1] - out_errors[0, 1]
+    est_e = gt_e + out_errors[:, 2] - out_errors[0, 2]
+    est_d = gt_e + out_errors[:, 3] - out_errors[0, 3]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.plot(gt_e,  gt_n,  'b-',  linewidth=2,   label='Ground Truth')
+    ax.plot(est_e, est_n, 'r--', linewidth=1.5, label='EKF Estimate')
+    ax.scatter(gt_e[0],  gt_n[0],  color='green', s=100, zorder=5, label='Start')
+    ax.scatter(gt_e[-1], gt_n[-1], color='blue',  s=100, marker='s', zorder=5, label='GT End')
+    ax.scatter(est_e[-1], est_n[-1], color='red', s=100, marker='s', zorder=5, label='EKF End')
+
+    ax.set_xlabel('East (m)', fontsize=12)
+    ax.set_ylabel('North (m)', fontsize=12)
+    ax.set_title('Trajectory: Ground Truth vs EKF Estimate (Top-Down)', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+
+    return fig

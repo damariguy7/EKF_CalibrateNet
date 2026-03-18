@@ -279,6 +279,8 @@ def lc_ekf_epoch(
 
     # Correct attitude, velocity, and position using (14.7-9)
     est_C_b_n_new = (np.eye(3) - skew_symmetric(x_est_new[0:3])) @ est_C_b_to_n_old
+    U, _, Vt = np.linalg.svd(est_C_b_n_new)
+    est_C_b_n_new = U @ Vt
     est_v_eb_n_new = est_v_eb_n_old - x_est_new[3:6]
 
 
@@ -287,13 +289,12 @@ def lc_ekf_epoch(
     h_b_est_new = est_h_b_old - x_est_new[8]
 
     # Update latitude using (5.56)
-    L_b_est_new = est_L_b_old - x_est_new[6]
-
-    # # Calculate meridian and transverse radii of curvature
-    # R_N_new, R_E_new = radii_of_curvature(L_b_est_new)
+    # x_est_new[6] is position error in meters (North); divide by R_N to convert to radians
+    L_b_est_new = est_L_b_old - x_est_new[6] / R_N
 
     # Update longitude using (5.56)
-    lambda_b_est_new = est_lambda_b_old - x_est_new[7]
+    # x_est_new[7] is position error in meters (East); divide by (R_E+h)*cos(L) to convert to radians
+    lambda_b_est_new = est_lambda_b_old - x_est_new[7] / ((R_E + est_h_b_old) * np.cos(est_L_b_old))
 
 
     est_L_b_new = L_b_est_new
