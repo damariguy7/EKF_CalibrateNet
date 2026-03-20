@@ -2,6 +2,7 @@
 # Date: December 15, 2025
 
 
+import glob
 import math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -71,6 +72,55 @@ LC_KF_config = {
     # 0.5 -> K[att] larger -> yaw correctable; K[bias] controlled by small bias_PSDs above
     'vel_meas_SD': 0.5
 }
+
+
+def _datasets_dir(config):
+    return config.get('datasets_dir') or os.path.join(config['data_path'], 'simulated_data')
+
+
+def _collect_scenario_data(file_name, config, dvl_cfg, kf_cfg):
+    """Load one simulated scenario CSV and return (dvl_features, dvl_labels)."""
+    d = _datasets_dir(config)
+    gt  = np.array(pd.read_csv(os.path.join(d, f'GT_{file_name}.csv'),  header=0).iloc[:, 0:10])
+    imu = np.array(pd.read_csv(os.path.join(d, f'IMU_{file_name}.csv'), header=0).iloc[:, 0:7])
+    dvl = np.array(pd.read_csv(os.path.join(d, f'DVL_{file_name}.csv'), header=0).iloc[:, 0:4])
+    trim = config.get('trim_start_seconds', 0)
+    if trim > 0:
+        gt  = gt[gt[:, 0]   >= trim]
+        imu = imu[imu[:, 0] >= trim]
+        dvl = dvl[dvl[:, 0] >= trim]
+    _, _, _, _, features, labels = lc_ins_dvl_sim(
+        imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg, collect_data=True)
+    return features, labels
+
+
+def _auto_split_scenarios(config):
+    """Discover GT CSVs matching config['scenarios_pattern'] and split 60/20/20."""
+    pattern = config.get('scenarios_pattern', '')
+    if not pattern:
+        return [], [], []
+
+    sim_dir = _datasets_dir(config)
+    matches = glob.glob(os.path.join(sim_dir, f'GT_{pattern}.csv'))
+    base_names = sorted(
+        os.path.basename(p)[len('GT_'):-len('.csv')] for p in matches
+    )
+    if not base_names:
+        print(f'[auto-split] No files matched pattern "GT_{pattern}.csv" in {sim_dir}')
+        return [], [], []
+
+    rng = np.random.default_rng(config.get('split_seed', 42))
+    shuffled = rng.permutation(base_names).tolist()
+
+    n = len(shuffled)
+    n_train = int(round(n * 0.6))
+    n_val   = int(round(n * 0.2))
+    train = shuffled[:n_train]
+    val   = shuffled[n_train:n_train + n_val]
+    test  = shuffled[n_train + n_val:]
+
+    print(f'[auto-split] {n} scenarios found → train={len(train)}, val={len(val)}, test={len(test)}')
+    return train, val, test
 
 
 def main(config):
@@ -195,39 +245,84 @@ def main(config):
     # =========================================================================
     # TRAIN DNN VELOCITY COMPENSATOR
     # =========================================================================
-    if config['train_model'] and config['data_type'] == 'sim':
-        print('Collecting training data...')
-        _, _, _, _, dvl_features, dvl_labels = lc_ins_dvl_sim(
-            in_imu_profile, in_dvl_profile, in_gt_profile,
-            no_epochs, DVL_config, LC_KF_config,
-            collect_data=True,
-        )
-
+    if config['train_model']:
         dnn_config = config.get('dnn_config', {})
-        print('Training DNN velocity compensator...')
-        model, norm_stats = train_vel_compensator(dvl_features, dvl_labels, dnn_config)
+        auto_train, auto_val, auto_test = _auto_split_scenarios(config)
+        train_scenarios = config.get('train_scenarios') or auto_train
+        val_scenarios   = config.get('val_scenarios')   or auto_val
+        if not config.get('test_scenarios') and auto_test:
+            config['_auto_test_scenarios'] = auto_test
 
-        model_path = os.path.join(config['data_path'], 'trained_model', 'vel_compensator.pt')
+        print(f'Collecting training data from {len(train_scenarios)} scenarios...')
+        train_feats, train_lbls = [], []
+        for i, sc in enumerate(train_scenarios, 1):
+            print(f'  [{i}/{len(train_scenarios)}] {sc}')
+            f, l = _collect_scenario_data(sc, config, DVL_config, LC_KF_config)
+            train_feats.append(f);  train_lbls.append(l)
+        all_train_features = np.concatenate(train_feats, axis=0)
+        all_train_labels   = np.concatenate(train_lbls,  axis=0)
+
+        all_val_features, all_val_labels = None, None
+        if val_scenarios:
+            print(f'Collecting validation data from {len(val_scenarios)} scenarios...')
+            val_feats, val_lbls = [], []
+            for i, sc in enumerate(val_scenarios, 1):
+                print(f'  [{i}/{len(val_scenarios)}] {sc}')
+                f, l = _collect_scenario_data(sc, config, DVL_config, LC_KF_config)
+                val_feats.append(f);  val_lbls.append(l)
+            all_val_features = np.concatenate(val_feats, axis=0)
+            all_val_labels   = np.concatenate(val_lbls,  axis=0)
+
+        print('Training DNN velocity compensator...')
+        model, norm_stats = train_vel_compensator(
+            all_train_features, all_train_labels, dnn_config,
+            all_val_features, all_val_labels)
+
+        arch       = dnn_config.get('arch', 'lstm')
+        model_path = os.path.join(config['data_path'], 'trained_model',
+                                  f'vel_compensator_{arch}.pt')
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         save_compensator(model, norm_stats, dnn_config, model_path)
 
     # =========================================================================
     # TEST DNN VELOCITY COMPENSATOR
     # =========================================================================
-    if config['test_model'] and config['data_type'] == 'sim':
-        model_path = os.path.join(config['data_path'], 'trained_model', 'vel_compensator.pt')
+    if config['test_model']:
+        import copy
+        dnn_config      = config.get('dnn_config', {})
+        arch            = dnn_config.get('arch', 'lstm')
+        test_scenarios  = config.get('test_scenarios') or config.get('_auto_test_scenarios', [])
+
+        model_path = os.path.join(config['data_path'], 'trained_model',
+                                  f'vel_compensator_{arch}.pt')
         print(f'Loading model from: {model_path}')
         compensator = load_compensator(model_path)
 
-        print('Running EKF + DNN compensator...')
-        out_profile_dnn, out_errors_dnn, out_IMU_bias_est_dnn, out_KF_SD_dnn = lc_ins_dvl_sim(
-            in_imu_profile, in_dvl_profile, in_gt_profile,
-            no_epochs, DVL_config, LC_KF_config,
-            compensator=compensator,
-        )
+        d = _datasets_dir(config)
+        for sc in test_scenarios:
+            print(f'Testing scenario: {sc}')
+            gt_t  = np.array(pd.read_csv(os.path.join(d, f'GT_{sc}.csv'),  header=0).iloc[:, 0:10])
+            imu_t = np.array(pd.read_csv(os.path.join(d, f'IMU_{sc}.csv'), header=0).iloc[:, 0:7])
+            dvl_t = np.array(pd.read_csv(os.path.join(d, f'DVL_{sc}.csv'), header=0).iloc[:, 0:4])
+            trim  = config.get('trim_start_seconds', 0)
+            if trim > 0:
+                gt_t  = gt_t[gt_t[:, 0]   >= trim]
+                imu_t = imu_t[imu_t[:, 0] >= trim]
+                dvl_t = dvl_t[dvl_t[:, 0] >= trim]
+            ne = imu_t.shape[0]
 
-        _save_plots(out_errors_dnn, out_KF_SD_dnn, out_IMU_bias_est_dnn, in_gt_profile,
-                    f"sim_{scenario}_{timestamp}_dnn")
+            _, out_err_base, out_bias_base, out_sd_base = lc_ins_dvl_sim(
+                imu_t, dvl_t, gt_t, ne, DVL_config, LC_KF_config)
+
+            _, out_err_dnn, out_bias_dnn, out_sd_dnn = lc_ins_dvl_sim(
+                imu_t, dvl_t, gt_t, ne, DVL_config, LC_KF_config,
+                compensator=copy.deepcopy(compensator))
+
+            ts = datetime.now().strftime('%d%m%y_%H%M')
+            _save_plots(out_err_base, out_sd_base, out_bias_base, gt_t,
+                        f"test_{sc}_{ts}_baseline")
+            _save_plots(out_err_dnn,  out_sd_dnn,  out_bias_dnn,  gt_t,
+                        f"test_{sc}_{ts}_dnn_{arch}")
 
 
 if __name__ == '__main__':
@@ -235,6 +330,10 @@ if __name__ == '__main__':
     # User-defined configuration (can be read from a config file or command-line arguments)
     user_config = {
         'data_path': "C:\\Users\\damar\\PycharmProjects\\EKF_CalibrateNet",
+        'datasets_dir': r'C:\Users\damar\MATLAB\Projects\EKFcompensateNet\simulated_EKF\long_turn_ba50-100-200ug_bg0p5-1-2dph_dvl1-2-5mms',
+                             # full path to MATLAB output subfolder, e.g.:
+                             # r'C:\Users\damar\MATLAB\Projects\EKFcompensateNet\simulated_EKF\long_turn_ba50-100-200ug_bg0p5-1-2dph_dvl1-2-5mms'
+                             # leave empty to fall back to simulated_data/
         'data_type': 'sim',  # "sim" or "real"
         'simulated_data_file_name': 'long_turn', #'static', 'straight', 'lawn_mower_50', 'lawn_mower600' 'long_turn', 'turn_n_straight'
         'real_data_trajectory_index': '1',  # 1-13
@@ -242,7 +341,17 @@ if __name__ == '__main__':
         'train_model': False,
         'test_model': False,
         'test_baseline_model': False,
-        'trained_model_path': "C:\\Users\\damar\\MATLAB\\Projects\\modeling-and-simulation-of-an-AUV-in-Simulink-master\\Work\\trained_model",
+        'train_scenarios': [  # file names under simulated_data/ used for training
+            # 'long_turn_s1_blow', 'long_turn_s2_blow', ...
+        ],
+        'val_scenarios': [    # held-out scenarios monitored during training
+            # 'long_turn_s7_blow', 'long_turn_s8_bhigh',
+        ],
+        'test_scenarios': [   # fully held-out scenarios for final evaluation
+            # 'long_turn_s9_bvhigh', 'long_turn_s10_bmed',
+        ],
+        'scenarios_pattern': 'long_turn_s*',   # e.g. 'long_turn_s*' — auto-discovers & splits 60/20/20
+        'split_seed': 42,          # RNG seed for reproducible auto-split
         'dnn_config': {
             'arch':        'lstm',  # 'lstm' | 'gru' | 'mlp'
             'window_size':  10,     # DVL epochs per input window (~10s)
