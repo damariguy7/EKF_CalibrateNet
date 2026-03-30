@@ -21,7 +21,7 @@ import navpy
 
 from matplotlib import pyplot as plt
 
-from lc_ekf_epoch import lc_ekf_epoch
+from lc_ekf_epoch import lc_ekf_epoch, update
 from euler_to_ctm import euler_to_ctm
 from initialize_ned_attitude import initialize_ned_attitude
 from ctm_to_euler import ctm_to_euler
@@ -44,6 +44,7 @@ def lc_ins_dvl_sim(
         lc_kf_config: Dict[str, float],
         collect_data: bool = False,
         compensator=None,
+        update_P_after_dnn: bool = False,
 ) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
@@ -275,6 +276,17 @@ def lc_ins_dvl_sim(
                 correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
                 if correction is not None:
                     est_v_eb_n = est_v_eb_n + correction
+
+                    # --- Optionally update P after DNN correction ---
+                    # Treats the DNN correction as a virtual NED-velocity measurement.
+                    # H selects velocity states (indices 3:6) directly in NED frame.
+                    # Toggle via update_P_after_dnn=True / False (default False = no change).
+                    if update_P_after_dnn:
+                        H_dnn = np.zeros((3, 15))
+                        H_dnn[0:3, 3:6] = np.eye(3)
+                        dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+                        R_dnn = np.eye(3) * dnn_sd ** 2
+                        P_matrix, _ = update(P_matrix, H_dnn, R_dnn)
 
             # --- DNN: store training sample (collect_data mode) ---
             if collect_data:

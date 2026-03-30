@@ -12,7 +12,7 @@ from datetime import datetime
 from lc_ins_dvl_real import lc_ins_dvl_real
 from lc_ins_dvl_sim import lc_ins_dvl_sim
 from lc_ins_dvl_sim_nadav import lc_ins_dvl_sim_nadav
-from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d
+from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d, plot_trajectory_2d_comparison, plot_errors_comparison
 from dnn_vel_compensator import (train_vel_compensator, save_compensator,
                                   load_compensator)
 
@@ -70,7 +70,12 @@ LC_KF_config = {
 
     # vel_meas_SD: 2.0 -> K[att] too small -> yaw can't be corrected -> diverges
     # 0.5 -> K[att] larger -> yaw correctable; K[bias] controlled by small bias_PSDs above
-    'vel_meas_SD': 0.5
+    'vel_meas_SD': 0.5,
+
+    # dnn_vel_SD: noise assumed for the DNN correction when update_P_after_dnn=True.
+    # Smaller value -> more trust in DNN -> stronger P shrinkage.
+    # Start equal to vel_meas_SD and tune based on DNN correction magnitude.
+    'dnn_vel_SD': 0.5,
 }
 
 
@@ -243,15 +248,22 @@ def main(config):
                     f"real_{scenario}_{timestamp}")
 
     # =========================================================================
+    # AUTO-SPLIT (run once, shared by train and test blocks)
+    # =========================================================================
+    if config.get('scenarios_pattern'):
+        auto_train, auto_val, auto_test = _auto_split_scenarios(config)
+        if not config.get('test_scenarios') and auto_test:
+            config['_auto_test_scenarios'] = auto_test
+    else:
+        auto_train, auto_val = [], []
+
+    # =========================================================================
     # TRAIN DNN VELOCITY COMPENSATOR
     # =========================================================================
     if config['train_model']:
         dnn_config = config.get('dnn_config', {})
-        auto_train, auto_val, auto_test = _auto_split_scenarios(config)
         train_scenarios = config.get('train_scenarios') or auto_train
         val_scenarios   = config.get('val_scenarios')   or auto_val
-        if not config.get('test_scenarios') and auto_test:
-            config['_auto_test_scenarios'] = auto_test
 
         print(f'Collecting training data from {len(train_scenarios)} scenarios...')
         train_feats, train_lbls = [], []
@@ -311,18 +323,44 @@ def main(config):
                 dvl_t = dvl_t[dvl_t[:, 0] >= trim]
             ne = imu_t.shape[0]
 
-            _, out_err_base, out_bias_base, out_sd_base = lc_ins_dvl_sim(
+            _, out_err_base,    out_bias_base,    out_sd_base    = lc_ins_dvl_sim(
                 imu_t, dvl_t, gt_t, ne, DVL_config, LC_KF_config)
 
-            _, out_err_dnn, out_bias_dnn, out_sd_dnn = lc_ins_dvl_sim(
+            _, out_err_dnn_np,  out_bias_dnn_np,  out_sd_dnn_np  = lc_ins_dvl_sim(
                 imu_t, dvl_t, gt_t, ne, DVL_config, LC_KF_config,
-                compensator=copy.deepcopy(compensator))
+                compensator=copy.deepcopy(compensator),
+                update_P_after_dnn=False)
+
+            _, out_err_dnn_p,   out_bias_dnn_p,   out_sd_dnn_p   = lc_ins_dvl_sim(
+                imu_t, dvl_t, gt_t, ne, DVL_config, LC_KF_config,
+                compensator=copy.deepcopy(compensator),
+                update_P_after_dnn=True)
 
             ts = datetime.now().strftime('%d%m%y_%H%M')
-            _save_plots(out_err_base, out_sd_base, out_bias_base, gt_t,
+            _save_plots(out_err_base,   out_sd_base,   out_bias_base,   gt_t,
                         f"test_{sc}_{ts}_baseline")
-            _save_plots(out_err_dnn,  out_sd_dnn,  out_bias_dnn,  gt_t,
-                        f"test_{sc}_{ts}_dnn_{arch}")
+            _save_plots(out_err_dnn_np, out_sd_dnn_np, out_bias_dnn_np, gt_t,
+                        f"test_{sc}_{ts}_dnn_{arch}_noP")
+            _save_plots(out_err_dnn_p,  out_sd_dnn_p,  out_bias_dnn_p,  gt_t,
+                        f"test_{sc}_{ts}_dnn_{arch}_withP")
+
+            # Comparison plots (all three runs on the same axes) → saved in withP folder
+            dnn_cmp_dir = os.path.join(config['data_path'], 'plots',
+                                       f"test_{sc}_{ts}_dnn_{arch}_withP")
+            fig_pos_cmp, fig_vel_cmp, fig_att_cmp = plot_errors_comparison(
+                out_err_base,   out_sd_base,
+                out_err_dnn_np, out_sd_dnn_np,
+                out_err_dnn_p,  out_sd_dnn_p,
+            )
+            fig_pos_cmp.savefig(os.path.join(dnn_cmp_dir, 'position_comparison.png'),  dpi=150, bbox_inches='tight')
+            fig_vel_cmp.savefig(os.path.join(dnn_cmp_dir, 'velocity_comparison.png'),  dpi=150, bbox_inches='tight')
+            fig_att_cmp.savefig(os.path.join(dnn_cmp_dir, 'attitude_comparison.png'),  dpi=150, bbox_inches='tight')
+            plt.close(fig_pos_cmp); plt.close(fig_vel_cmp); plt.close(fig_att_cmp)
+
+            # Trajectory comparison (GT + baseline + DNN no-P + DNN with-P)
+            fig_cmp = plot_trajectory_2d_comparison(gt_t, out_err_base, out_err_dnn_np, out_err_dnn_p)
+            fig_cmp.savefig(os.path.join(dnn_cmp_dir, 'trajectory_comparison.png'), dpi=150, bbox_inches='tight')
+            plt.close(fig_cmp)
 
 
 if __name__ == '__main__':
@@ -339,7 +377,7 @@ if __name__ == '__main__':
         'real_data_trajectory_index': '1',  # 1-13
         'trim_start_seconds': 50,  # cut first N seconds (0 = no trim)
         'train_model': False,
-        'test_model': False,
+        'test_model': True,
         'test_baseline_model': False,
         'train_scenarios': [  # file names under simulated_data/ used for training
             # 'long_turn_s1_blow', 'long_turn_s2_blow', ...

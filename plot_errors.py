@@ -299,6 +299,79 @@ def plot_results(out_errors, out_KF_SD):
     # plt.show()
 
 
+def plot_errors_comparison(out_errors_base, out_sd_base,
+                           out_errors_dnn_np, out_sd_dnn_np,
+                           out_errors_dnn_p, out_sd_dnn_p):
+    """
+    Overlay position, velocity, and attitude errors for three runs:
+      - Baseline EKF (grey)
+      - DNN, no P update (blue)
+      - DNN, with P update (red)
+
+    Returns
+    -------
+    fig_pos, fig_vel, fig_att : three matplotlib figures
+    """
+    runs = [
+        ('Baseline',         out_errors_base,    out_sd_base,    'dimgrey', '--'),
+        ('DNN (no P-update)', out_errors_dnn_np, out_sd_dnn_np,  'steelblue', '-'),
+        ('DNN (P-update)',    out_errors_dnn_p,  out_sd_dnn_p,   'crimson',   '-'),
+    ]
+
+    deg_to_rad = 0.01745329252
+
+    # ---- Position ----
+    fig_pos, axes_pos = plt.subplots(3, 1, figsize=(13, 11))
+    fig_pos.suptitle('Position Errors: Baseline vs DNN vs DNN+P-update', fontsize=13, fontweight='bold')
+    pos_labels = ['North (m)', 'East (m)', 'Down (m)']
+    for i, ax in enumerate(axes_pos):
+        for label, errs, sds, color, ls in runs:
+            t_e = errs[:, 0]
+            t_s = sds[:, 0]
+            ax.plot(t_e, errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(t_s, -sds[:, 7 + i], sds[:, 7 + i], color=color, alpha=0.12)
+        ax.set_ylabel(pos_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # ---- Velocity ----
+    fig_vel, axes_vel = plt.subplots(3, 1, figsize=(13, 11))
+    fig_vel.suptitle('Velocity Errors: Baseline vs DNN vs DNN+P-update', fontsize=13, fontweight='bold')
+    vel_labels = ['North (m/s)', 'East (m/s)', 'Down (m/s)']
+    for i, ax in enumerate(axes_vel):
+        for label, errs, sds, color, ls in runs:
+            t_e = errs[:, 0]
+            t_s = sds[:, 0]
+            ax.plot(t_e, errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(t_s, -sds[:, 4 + i], sds[:, 4 + i], color=color, alpha=0.12)
+        ax.set_ylabel(vel_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # ---- Attitude ----
+    fig_att, axes_att = plt.subplots(3, 1, figsize=(13, 11))
+    fig_att.suptitle('Attitude Errors: Baseline vs DNN vs DNN+P-update', fontsize=13, fontweight='bold')
+    att_labels = ['Roll (deg)', 'Pitch (deg)', 'Yaw (deg)']
+    for i, ax in enumerate(axes_att):
+        for label, errs, sds, color, ls in runs:
+            t_e = errs[:, 0]
+            t_s = sds[:, 0]
+            ax.plot(t_e, np.rad2deg(errs[:, 7 + i]), color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(t_s, -np.rad2deg(sds[:, 1 + i]), np.rad2deg(sds[:, 1 + i]),
+                            color=color, alpha=0.12)
+        ax.set_ylabel(att_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    return fig_pos, fig_vel, fig_att
+
+
 def plot_trajectory_2d(in_gt_profile, out_errors):
     """
     Plot 2D top-down GT and EKF-estimated trajectory (North vs East).
@@ -352,4 +425,47 @@ def plot_trajectory_2d(in_gt_profile, out_errors):
     ax.set_aspect('equal')
     plt.tight_layout()
 
+    return fig
+
+
+def plot_trajectory_2d_comparison(in_gt_profile, out_errors_base,
+                                   out_errors_dnn_np, out_errors_dnn_p):
+    """2D trajectory: GT, baseline EKF, DNN (no P-update), DNN (with P-update) on one axes."""
+    lat_ref = np.rad2deg(in_gt_profile[0, 1])
+    lon_ref = np.rad2deg(in_gt_profile[0, 2])
+    h_ref   = in_gt_profile[0, 3]
+
+    gt_ned = np.array([
+        navpy.lla2ned(
+            np.rad2deg(in_gt_profile[i, 1]),
+            np.rad2deg(in_gt_profile[i, 2]),
+            in_gt_profile[i, 3],
+            lat_ref, lon_ref, h_ref
+        )
+        for i in range(len(in_gt_profile))
+    ])
+    gt_n, gt_e = gt_ned[:, 0], gt_ned[:, 1]
+
+    def _traj(errs):
+        return (gt_n + errs[:, 1] - errs[0, 1],
+                gt_e + errs[:, 2] - errs[0, 2])
+
+    base_n,   base_e   = _traj(out_errors_base)
+    dnn_np_n, dnn_np_e = _traj(out_errors_dnn_np)
+    dnn_p_n,  dnn_p_e  = _traj(out_errors_dnn_p)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.plot(gt_e,     gt_n,     'b-',  linewidth=2,   label='Ground Truth')
+    ax.plot(base_e,   base_n,   color='dimgrey',   linewidth=1.5, linestyle='--', label='Baseline EKF')
+    ax.plot(dnn_np_e, dnn_np_n, color='steelblue', linewidth=1.5, linestyle='-',  label='DNN (no P-update)')
+    ax.plot(dnn_p_e,  dnn_p_n,  color='crimson',   linewidth=1.5, linestyle='-',  label='DNN (P-update)')
+    ax.scatter(gt_e[0], gt_n[0], color='black', s=100, zorder=5, label='Start')
+
+    ax.set_xlabel('East (m)', fontsize=12)
+    ax.set_ylabel('North (m)', fontsize=12)
+    ax.set_title('Trajectory: GT vs Baseline vs DNN vs DNN+P-update', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    plt.tight_layout()
     return fig
