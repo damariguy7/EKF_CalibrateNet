@@ -469,3 +469,306 @@ def plot_trajectory_2d_comparison(in_gt_profile, out_errors_base,
     ax.set_aspect('equal')
     plt.tight_layout()
     return fig
+
+
+def plot_pos_vel_two_runs(out_err_base, out_sd_base,
+                          out_err_dnn_p=None, out_sd_dnn_p=None,
+                          scenario='', arch='lstm',
+                          out_err_dnn_np=None, out_sd_dnn_np=None,
+                          base_label='Baseline'):
+    """
+    Overlay position and velocity errors for one, two, or three runs on the same
+    axes, with ±1σ shading. base_label customises the baseline-style legend
+    entry (e.g. 'Nadav EKF'). DNN runs are drawn only when their args are given.
+
+    Returns
+    -------
+    fig_pos, fig_vel : two matplotlib figures
+    """
+    runs = [(base_label, out_err_base, out_sd_base, 'dimgrey', '--')]
+    if out_err_dnn_p is not None and out_sd_dnn_p is not None:
+        runs.append((f'DNN ({arch}, P-update)', out_err_dnn_p, out_sd_dnn_p, 'crimson', '-'))
+    if out_err_dnn_np is not None and out_sd_dnn_np is not None:
+        runs.insert(1, (f'DNN ({arch}, no-P)', out_err_dnn_np, out_sd_dnn_np, 'steelblue', '-'))
+    title_suffix = f' — {scenario}' if scenario else ''
+
+    # ---- Position ----
+    fig_pos, axes_pos = plt.subplots(3, 1, figsize=(13, 11))
+    fig_pos.suptitle(f'Position Errors{title_suffix}', fontsize=13, fontweight='bold')
+    pos_labels = ['North (m)', 'East (m)', 'Down (m)']
+    for i, ax in enumerate(axes_pos):
+        for label, errs, sds, color, ls in runs:
+            ax.plot(errs[:, 0], errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(sds[:, 0], -sds[:, 7 + i], sds[:, 7 + i], color=color, alpha=0.12)
+        ax.set_ylabel(pos_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # ---- Velocity ----
+    fig_vel, axes_vel = plt.subplots(3, 1, figsize=(13, 11))
+    fig_vel.suptitle(f'Velocity Errors{title_suffix}', fontsize=13, fontweight='bold')
+    vel_labels = ['North (m/s)', 'East (m/s)', 'Down (m/s)']
+    for i, ax in enumerate(axes_vel):
+        for label, errs, sds, color, ls in runs:
+            ax.plot(errs[:, 0], errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(sds[:, 0], -sds[:, 4 + i], sds[:, 4 + i], color=color, alpha=0.12)
+        ax.set_ylabel(vel_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    return fig_pos, fig_vel
+
+
+def plot_att_bias_two_runs(out_err_base, out_sd_base, out_bias_base,
+                           out_err_dnn_p=None, out_sd_dnn_p=None, out_bias_dnn_p=None,
+                           scenario='', arch='lstm',
+                           base_label='Baseline'):
+    """
+    Overlay attitude errors and IMU bias estimates for one or two runs
+    with ±1σ shading. base_label customises the baseline-style legend entry
+    (e.g. 'Nadav EKF'). DNN run is drawn only when its args are provided.
+
+    Column layout used:
+      out_errors  : att at cols 7-9 (rad)
+      out_KF_SD   : att_std at cols 1-3, accel_bias_std at 10-12, gyro_bias_std at 13-15
+      out_IMU_bias: accel bias at cols 1-3 (m/s²), gyro bias at cols 4-6 (rad/s)
+
+    Returns
+    -------
+    fig_att, fig_bias_a, fig_bias_g : three matplotlib figures
+    """
+    micro_g = 9.80665e-6
+    deg_to_rad = 0.01745329252
+
+    runs = [(base_label, out_err_base, out_sd_base, out_bias_base, 'dimgrey', '--')]
+    if (out_err_dnn_p is not None and out_sd_dnn_p is not None
+            and out_bias_dnn_p is not None):
+        runs.append((f'DNN ({arch}, P-update)', out_err_dnn_p, out_sd_dnn_p,
+                     out_bias_dnn_p, 'crimson', '-'))
+    title_suffix = f' — {scenario}' if scenario else ''
+
+    # ---- Attitude ----
+    fig_att, axes_att = plt.subplots(3, 1, figsize=(13, 11))
+    fig_att.suptitle(f'Attitude Errors{title_suffix}', fontsize=13, fontweight='bold')
+    att_labels = ['Roll (deg)', 'Pitch (deg)', 'Yaw (deg)']
+    for i, ax in enumerate(axes_att):
+        for label, errs, sds, _, color, ls in runs:
+            ax.plot(errs[:, 0], np.rad2deg(errs[:, 7 + i]),
+                    color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(sds[:, 0],
+                            -np.rad2deg(sds[:, 1 + i]), np.rad2deg(sds[:, 1 + i]),
+                            color=color, alpha=0.12)
+        ax.set_ylabel(att_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # ---- Accel bias ----
+    fig_bias_a, axes_ba = plt.subplots(3, 1, figsize=(13, 11))
+    fig_bias_a.suptitle(f'Accel Bias Estimate{title_suffix}', fontsize=13, fontweight='bold')
+    bias_a_labels = ['X-axis (μg)', 'Y-axis (μg)', 'Z-axis (μg)']
+    for i, ax in enumerate(axes_ba):
+        for label, errs, sds, bias, color, ls in runs:
+            ax.plot(bias[:, 0], bias[:, 1 + i] / micro_g,
+                    color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(sds[:, 0],
+                            -sds[:, 10 + i] / micro_g, sds[:, 10 + i] / micro_g,
+                            color=color, alpha=0.12)
+        ax.set_ylabel(bias_a_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # ---- Gyro bias ----
+    fig_bias_g, axes_bg = plt.subplots(3, 1, figsize=(13, 11))
+    fig_bias_g.suptitle(f'Gyro Bias Estimate{title_suffix}', fontsize=13, fontweight='bold')
+    bias_g_labels = ['X-axis (deg/h)', 'Y-axis (deg/h)', 'Z-axis (deg/h)']
+    dph = deg_to_rad / 3600
+    for i, ax in enumerate(axes_bg):
+        for label, errs, sds, bias, color, ls in runs:
+            ax.plot(bias[:, 0], bias[:, 4 + i] / dph,
+                    color=color, linewidth=1.5, linestyle=ls, label=label)
+            ax.fill_between(sds[:, 0],
+                            -sds[:, 13 + i] / dph, sds[:, 13 + i] / dph,
+                            color=color, alpha=0.12)
+        ax.set_ylabel(bias_g_labels[i], fontsize=10)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    return fig_att, fig_bias_a, fig_bias_g
+
+
+def plot_trajectory_two_runs(in_gt_profile, out_err_base, out_err_dnn_p=None,
+                              scenario='', arch='lstm',
+                              base_label='Baseline EKF'):
+    """
+    Plot 2D top-down trajectory for GT and one or two estimates on the same axes.
+    base_label customises the baseline-style legend entry (e.g. 'Nadav EKF').
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    lat_ref = np.rad2deg(in_gt_profile[0, 1])
+    lon_ref = np.rad2deg(in_gt_profile[0, 2])
+    h_ref   = in_gt_profile[0, 3]
+
+    gt_ned = np.array([
+        navpy.lla2ned(
+            np.rad2deg(in_gt_profile[i, 1]),
+            np.rad2deg(in_gt_profile[i, 2]),
+            in_gt_profile[i, 3],
+            lat_ref, lon_ref, h_ref
+        )
+        for i in range(len(in_gt_profile))
+    ])
+    gt_n, gt_e = gt_ned[:, 0], gt_ned[:, 1]
+
+    def _traj(errs):
+        return (gt_n + errs[:, 1],
+                gt_e + errs[:, 2])
+
+    base_n, base_e = _traj(out_err_base)
+
+    title_suffix = f' — {scenario}' if scenario else ''
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.suptitle(f'Trajectory{title_suffix}', fontsize=13, fontweight='bold')
+    ax.plot(gt_e,   gt_n,   'b-',  linewidth=2,   label='Ground Truth')
+    ax.plot(base_e, base_n, color='dimgrey', linewidth=1.5, linestyle='--', label=base_label)
+    if out_err_dnn_p is not None:
+        dnn_n, dnn_e = _traj(out_err_dnn_p)
+        ax.plot(dnn_e, dnn_n, color='crimson', linewidth=1.5, linestyle='-',
+                label=f'DNN ({arch}, P-update)')
+    ax.scatter(gt_e[0], gt_n[0], color='black', s=100, zorder=5, label='Start')
+    ax.set_xlabel('East (m)', fontsize=12)
+    ax.set_ylabel('North (m)', fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    return fig
+
+
+def plot_rmse_over_time(time, pos_rmse_base, vel_rmse_base,
+                        pos_rmse_dnn, vel_rmse_dnn,
+                        arch='lstm', n_scenarios=0):
+    """
+    Plot 3D position and velocity RMSE over time, averaged across all test scenarios.
+
+    At each time step t:
+        pos_RMSE(t) = sqrt( mean over scenarios of (eN(t)^2 + eE(t)^2 + eD(t)^2) )
+        vel_RMSE(t) = sqrt( mean over scenarios of (evN(t)^2 + evE(t)^2 + evD(t)^2) )
+
+    Parameters
+    ----------
+    time : np.ndarray  shape (T,)
+    pos_rmse_base, vel_rmse_base : np.ndarray  shape (T,)  — baseline EKF
+    pos_rmse_dnn,  vel_rmse_dnn  : np.ndarray  shape (T,)  — DNN with P-update
+    arch : str   DNN architecture label for legend
+    n_scenarios : int  number of test scenarios (for title)
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    title = f'RMSE over Test Set ({n_scenarios} scenarios)' if n_scenarios else 'RMSE over Test Set'
+    dnn_label = f'DNN ({arch}, P-update)'
+
+    fig, (ax_pos, ax_vel) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    ax_pos.plot(time, pos_rmse_base, color='steelblue', linewidth=1.8, label='Baseline EKF')
+    ax_pos.plot(time, pos_rmse_dnn,  color='crimson',   linewidth=1.8, label=dnn_label)
+    ax_pos.set_ylabel('Position RMSE [m]', fontsize=11)
+    ax_pos.legend(fontsize=10)
+    ax_pos.grid(True, alpha=0.3)
+
+    ax_vel.plot(time, vel_rmse_base, color='steelblue', linewidth=1.8, label='Baseline EKF')
+    ax_vel.plot(time, vel_rmse_dnn,  color='crimson',   linewidth=1.8, label=dnn_label)
+    ax_vel.set_ylabel('Velocity RMSE [m/s]', fontsize=11)
+    ax_vel.set_xlabel('Time [s]', fontsize=11)
+    ax_vel.legend(fontsize=10)
+    ax_vel.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_prmse_vrmse_per_trajectory(scenario_names, prmse_base, vrmse_base,
+                                    prmse_dnn_p, vrmse_dnn_p, arch='lstm',
+                                    prmse_dnn_np=None, vrmse_dnn_np=None):
+    """
+    Two separate bar-chart figures showing per-trajectory scalar PRMSE and VRMSE.
+
+    For each trajectory i:
+        PRMSE_i = sqrt( mean_over_time( eN^2 + eE^2 + eD^2 ) )
+        VRMSE_i = sqrt( mean_over_time( evN^2 + evE^2 + evD^2 ) )
+
+    Parameters
+    ----------
+    scenario_names        : list of str
+    prmse_base, vrmse_base: list of float  — baseline EKF scalar per trajectory
+    prmse_dnn_p, vrmse_dnn_p : list of float  — DNN with P-update
+    arch                  : str  DNN architecture label for legend
+    prmse_dnn_np, vrmse_dnn_np : list of float or None — DNN without P-update (optional)
+
+    Returns
+    -------
+    fig_prmse, fig_vrmse : matplotlib.figure.Figure
+    """
+    n = len(scenario_names)
+    x = np.arange(n)
+    has_np = prmse_dnn_np is not None and vrmse_dnn_np is not None
+    n_bars = 3 if has_np else 2
+    width = 0.22 if has_np else 0.35
+    short_names = [s.split('_s')[-1] if '_s' in s else s for s in scenario_names]
+
+    def _add_labels(ax, bars):
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f'{bar.get_height():.3f}', ha='center', va='bottom', fontsize=7)
+
+    def _make_bar_fig(base_vals, dnn_np_vals, dnn_p_vals, ylabel, title):
+        fig, ax = plt.subplots(figsize=(max(7, n * 1.3), 5))
+        if has_np:
+            offsets = [-width, 0, width]
+        else:
+            offsets = [-width / 2, width / 2]
+        bars_base = ax.bar(x + offsets[0], base_vals, width,
+                           color='dimgrey',   label='Baseline EKF')
+        _add_labels(ax, bars_base)
+        if has_np:
+            bars_np = ax.bar(x + offsets[1], dnn_np_vals, width,
+                             color='steelblue', label=f'DNN ({arch}, no-P)')
+            _add_labels(ax, bars_np)
+            bars_p = ax.bar(x + offsets[2], dnn_p_vals, width,
+                            color='crimson',   label=f'DNN ({arch}, P-update)')
+            _add_labels(ax, bars_p)
+        else:
+            bars_p = ax.bar(x + offsets[1], dnn_p_vals, width,
+                            color='crimson',   label=f'DNN ({arch}, P-update)')
+            _add_labels(ax, bars_p)
+        ax.set_xticks(x)
+        ax.set_xticklabels(short_names, rotation=30, ha='right', fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, axis='y', alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    fig_prmse = _make_bar_fig(prmse_base, prmse_dnn_np, prmse_dnn_p,
+                               'Position RMSE [m]',
+                               f'PRMSE per Trajectory ({n} scenarios)')
+    fig_vrmse = _make_bar_fig(vrmse_base, vrmse_dnn_np, vrmse_dnn_p,
+                               'Velocity RMSE [m/s]',
+                               f'VRMSE per Trajectory ({n} scenarios)')
+    return fig_prmse, fig_vrmse

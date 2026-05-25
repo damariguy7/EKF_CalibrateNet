@@ -109,12 +109,12 @@ def lc_ins_dvl_sim(
     std_devs = np.sqrt(P_diag)
 
     # Step 2: Generate initial errors (50% of std with random sign)
-    np.random.seed(42)  # For reproducibility (change or remove for different errors each run)
+    # np.random.seed(42)  # For reproducibility (change or remove for different errors each run)
     initial_errors = np.zeros(15)
 
-    for i in range(15):
-        sign = np.random.choice([-1, 1])  # Random positive or negative
-        initial_errors[i] = sign * 0.5 * std_devs[i]  # 50% of standard deviation
+    # for i in range(15):
+    #     sign = np.random.choice([-1, 1])  # Random positive or negative
+    #     initial_errors[i] = sign * 0.5 * std_devs[i]  # 50% of standard deviation
 
 
     # Convert initial position errors from meters to radians for lat/lon

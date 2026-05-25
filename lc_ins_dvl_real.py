@@ -17,7 +17,7 @@ import os
 import pandas as pd
 from typing import Tuple, Dict, Any
 import sys
-from lc_ekf_epoch import lc_ekf_epoch
+from lc_ekf_epoch import lc_ekf_epoch, update
 from euler_to_ctm import euler_to_ctm
 from initialize_ned_attitude import initialize_ned_attitude
 from ctm_to_euler import ctm_to_euler
@@ -36,7 +36,10 @@ def lc_ins_dvl_real(
         no_epochs: int,
         dvl_config: Dict[str, Any],
         lc_kf_config: Dict[str, float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        collect_data: bool = False,
+        compensator=None,
+        update_P_after_dnn: bool = False,
+) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
 
@@ -94,10 +97,9 @@ def lc_ins_dvl_real(
     true_L_b = in_gt_profile[0, 1]
     true_lambda_b = in_gt_profile[0, 2]
     true_h_b = in_gt_profile[0, 3]
-    true_v_eb_b = in_gt_profile[0, 4:7].copy()
+    true_v_eb_n = in_gt_profile[0, 4:7].copy()    # GT cols 4:7 are V_N, V_E, V_D (already NED)
     true_eul_nb = in_gt_profile[0, 7:10].copy()
-    true_C_b_n = euler_to_ctm(true_eul_nb)
-    true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_nb)
+    true_C_b_n = euler_to_ctm(true_eul_nb).T
 
     # old_true_r_eb_e, old_true_v_eb_e, old_true_C_b_e = ned_to_ecef(
     #     true_L_b, true_lambda_b, true_h_b, true_v_eb_n, true_C_b_n
@@ -134,6 +136,7 @@ def lc_ins_dvl_real(
     # est_L_b = old_est_L_b
 
     # Initialize estimated attitude solution
+
 
     # _, _, old_est_C_b_e = ned_to_ecef(
     #     old_est_L_b, old_est_lambda_b, old_est_h_b,
@@ -202,6 +205,10 @@ def lc_ins_dvl_real(
     time_last_dvl = old_time
     dvl_epoch = 0
 
+    # DNN data collection buffers (filled at every DVL epoch when collect_data=True)
+    dvl_features_list = [] if collect_data else None
+    dvl_labels_list   = [] if collect_data else None
+
     # Progress bar
     print('Processing: ', end='', flush=True)
     progress_mark = 0
@@ -220,10 +227,9 @@ def lc_ins_dvl_real(
         true_L_b = in_gt_profile[dvl_epoch, 1]
         true_lambda_b = in_gt_profile[dvl_epoch, 2]
         true_h_b = in_gt_profile[dvl_epoch, 3]
-        true_v_eb_b = in_gt_profile[dvl_epoch, 4:7].copy()
+        true_v_eb_n = in_gt_profile[dvl_epoch, 4:7].copy()    # already NED
         true_eul_nb = in_gt_profile[dvl_epoch, 7:10].copy()
-        true_C_b_n = euler_to_ctm(true_eul_nb)
-        true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_nb)
+        true_C_b_n = euler_to_ctm(true_eul_nb).T
 
         # true_r_eb_e, true_v_eb_e, true_C_b_e = ned_to_ecef(
         #     true_L_b, true_lambda_b, true_h_b, true_v_eb_n, true_C_b_n
@@ -261,35 +267,53 @@ def lc_ins_dvl_real(
             true_L_b = in_gt_profile[dvl_epoch, 1]
             true_lambda_b = in_gt_profile[dvl_epoch, 2]
             true_h_b = in_gt_profile[dvl_epoch, 3]
-            true_v_eb_b = in_gt_profile[dvl_epoch, 4:7].copy()
+            true_v_eb_n = in_gt_profile[dvl_epoch, 4:7].copy()    # already NED
             true_eul_nb = in_gt_profile[dvl_epoch, 7:10].copy()
-            true_C_b_n = euler_to_ctm(true_eul_nb)
-            true_v_eb_n = body_to_ned(true_v_eb_b, true_eul_nb)
+            true_C_b_n = euler_to_ctm(true_eul_nb).T
 
 
-            dvl_v_eb_n = in_dvl_profile[dvl_epoch, 1:4]
+            dvl_v_eb_b = in_dvl_profile[dvl_epoch, 1:4]    # DVL body frame (X,Y,Z)
 
-            # print("dvl_epoch:", dvl_epoch)  #for debug
-            # if(dvl_epoch == 10):
-            #     print("breakpoint debug")  # for debug
+            # Capture pre-update state for DNN feature construction
+            v_ekf_pre  = est_v_eb_n.copy()
+            euler_pre  = ctm_to_euler(est_C_b_n)
+            innovation = est_C_b_n.T @ v_ekf_pre - dvl_v_eb_b    # body_EKF - body_DVL
 
             # Run Integration Kalman filter
             est_C_b_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
-                dvl_v_eb_n, tor_s, est_C_b_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
+                dvl_v_eb_b, tor_s, est_C_b_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
                 meas_f_ib_b, meas_omega_ib_b, lc_kf_config
             )
 
-            # Generate IMU bias and clock output records
-            out_imu_bias_est[epoch, 0] = time
-            out_imu_bias_est[epoch, 1:7] = est_imu_bias
-            # out_clock[gnss_epoch, 0] = time
-            # out_clock[gnss_epoch, 1:3] = est_clock
+            # DNN training-data collection (one sample per DVL epoch)
+            if collect_data:
+                feat  = np.concatenate([innovation, dvl_v_eb_b, v_ekf_pre, euler_pre])
+                label = true_v_eb_n - est_v_eb_n          # remaining error after EKF update
+                dvl_features_list.append(feat)
+                dvl_labels_list.append(label)
+
+            # DNN velocity compensation (inference mode)
+            if compensator is not None:
+                correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
+                if correction is not None:
+                    H_dnn = np.zeros((3, 15))
+                    H_dnn[0:3, 3:6] = np.eye(3)
+                    dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+                    R_dnn = np.eye(3) * dnn_sd ** 2
+                    P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
+                    # Sign convention matches DVL: delta_z = v_nom - z_meas = -correction
+                    x_dnn = K_dnn @ (-correction)
+                    est_v_eb_n = est_v_eb_n - x_dnn[3:6]
 
             # Generate KF uncertainty output record
             out_kf_sd[epoch, 0] = time
             for i in range(15):
                 out_kf_sd[epoch, i + 1] = np.sqrt(P_matrix[i, i])
 
+
+        # Generate IMU bias output record (every IMU epoch)
+        out_imu_bias_est[epoch, 0] = time
+        out_imu_bias_est[epoch, 1:7] = est_imu_bias
 
         # Generate output profile record
         out_profile[epoch, 0] = time
@@ -314,7 +338,7 @@ def lc_ins_dvl_real(
         # Reset old values
         old_time = time
         old_est_L_b = est_L_b
-        old_est_lambda_b = est_L_b
+        old_est_lambda_b = est_lambda_b
         old_est_h_b = est_h_b
         old_est_v_eb_n = est_v_eb_n.copy()
         old_est_C_b_n = est_C_b_n.copy()
@@ -328,6 +352,11 @@ def lc_ins_dvl_real(
     # out_imu_bias_est = out_imu_bias_est[:dvl_epoch + 1, :]
     # # out_clock = out_clock[:gnss_epoch + 1, :]
     # out_kf_sd = out_kf_sd[:no_epochs + 1, :]
+
+    if collect_data:
+        dvl_features = np.array(dvl_features_list)   # (N_dvl, 12)
+        dvl_labels   = np.array(dvl_labels_list)     # (N_dvl,  3)
+        return out_profile, out_errors, out_imu_bias_est, out_kf_sd, dvl_features, dvl_labels
 
     return out_profile, out_errors, out_imu_bias_est, out_kf_sd
 
