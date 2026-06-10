@@ -24,6 +24,23 @@ rad_to_deg = 1 / deg_to_rad
 micro_g_to_meters_per_second_squared = 9.80665e-6
 
 
+def _lr_token(lr):
+    """Encode the learning rate as 'lr<n>'.
+
+    For a clean power of ten, n is the magnitude of the exponent, e.g.
+    1e-8 -> 'lr8', 1e-3 -> 'lr3'. For a non-power-of-ten lr we fall back to a
+    filesystem-safe mantissa/exponent form, e.g. 5e-4 -> 'lr5em4'.
+    """
+    try:
+        exp = -math.log10(lr)
+    except (ValueError, TypeError):
+        return f"lr{str(lr).replace('.', 'p').replace('-', 'm')}"
+    if abs(exp - round(exp)) < 1e-9:
+        return f"lr{int(round(exp))}"
+    s = f"{lr:.0e}".replace('-', 'm').replace('+', 'p').replace('.', 'p')
+    return f"lr{s}"
+
+
 def _dnn_config_token(dnn_config, dnn_vel_sd=None):
     """Return a directory-friendly DNN config string used for plot folder names.
 
@@ -45,6 +62,12 @@ def _dnn_config_token(dnn_config, dnn_vel_sd=None):
     ]
     if dnn_vel_sd is not None:
         parts.append(f"sd{str(dnn_vel_sd).replace('.', 'p')}")
+    # Mode token: omit for 'sequential' to keep backwards-compatibility with
+    # checkpoints/plot folders generated before joint mode existed.
+    mode = dnn_config.get('dnn_mode', 'sequential')
+    if mode != 'sequential':
+        parts.append(f"m{mode}")
+    parts.append(_lr_token(dnn_config.get('lr', 1e-3)))
     tag = dnn_config.get('tag', '')
     if tag:
         parts.append(str(tag))
@@ -72,6 +95,11 @@ def _build_model_filename(data_type, dnn_config, sim_trajectory_name):
         f"l{dnn_config.get('num_layers', 2)}",
         f"e{dnn_config.get('epochs', 100)}",
     ]
+    # Mode token: omit for 'sequential' so existing sequential checkpoints still load.
+    mode = dnn_config.get('dnn_mode', 'sequential')
+    if mode != 'sequential':
+        parts.append(f"m{mode}")
+    parts.append(_lr_token(dnn_config.get('lr', 1e-3)))
     tag = dnn_config.get('tag', '')
     if tag:
         parts.append(str(tag))
@@ -158,11 +186,18 @@ def _load_scenario(data_dir, name, trim_start, scale_imu):
     return gt, imu, dvl
 
 
-def _collect_scenario_data(name, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg):
-    """Run one scenario through the EKF in collect mode, return (features, labels)."""
+def _collect_scenario_data(name, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
+                           dnn_mode='sequential'):
+    """Run one scenario through the EKF in collect mode, return (features, labels).
+
+    `dnn_mode` selects the label expression: 'sequential' yields the post-DVL
+    residual, 'joint' yields the pre-DVL residual (the target a DNN co-fused
+    with DVL in a single Kalman update must learn).
+    """
     gt, imu, dvl = _load_scenario(data_dir, name, trim_start, scale_imu)
     _, _, _, _, features, labels = ekf_fn(
-        imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg, collect_data=True)
+        imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg,
+        collect_data=True, dnn_mode=dnn_mode)
     return features, labels
 
 
@@ -220,6 +255,44 @@ def _write_config_txt(plots_dir, scenario_name, config, data_dir,
         f.write('\n'.join(lines) + '\n')
 
 
+def _save_training_results(history, out_dir):
+    """Persist the per-epoch train/val loss curves to <out_dir>.
+
+    Writes two files:
+      - training_curve.csv  : epoch, train_loss, val_loss (raw numbers)
+      - training_curve.png  : log-scale loss-vs-epoch plot
+    Losses are on the normalised scale used during training (≈1.0 means the
+    model is no better than predicting the label mean).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    epochs     = history['epoch']
+    train_loss = history['train_loss']
+    val_loss   = history['val_loss']
+    has_val    = any(v is not None for v in val_loss)
+
+    csv_path = os.path.join(out_dir, 'training_curve.csv')
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write('epoch,train_loss,val_loss\n')
+        for e, tr, va in zip(epochs, train_loss, val_loss):
+            f.write(f"{e},{tr:.8f},{'' if va is None else f'{va:.8f}'}\n")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, train_loss, label='train', color='tab:blue')
+    if has_val:
+        ax.plot(epochs, val_loss, label='val', color='tab:orange')
+    ax.axhline(1.0, color='gray', ls='--', lw=0.8, label='predict-mean baseline')
+    ax.set_xlabel('epoch')
+    ax.set_ylabel('MSE (normalised)')
+    ax.set_yscale('log')
+    ax.set_title('DNN velocity compensator training')
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend()
+    png_path = os.path.join(out_dir, 'training_curve.png')
+    fig.savefig(png_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Training curves saved to: {out_dir}')
+
+
 def main(config):
     np.random.seed(2)
 
@@ -232,6 +305,10 @@ def main(config):
     trim_start  = config.get('trim_start_seconds', 0) if data_type == 'sim' else 0
     output_dir  = config['output_dir']
     seed        = config.get('split_seed', 42)
+
+    # One timestamp per run, appended to every results folder so repeated runs
+    # with the same config don't overwrite each other (format: YYYYMMDD_HHMMSS).
+    run_stamp   = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     if data_type == 'sim':
         files = _discover_sim_scenarios(data_dir, config['sim_trajectory_name'])
@@ -247,13 +324,15 @@ def main(config):
     # =========================================================================
     if config['train_data']:
         dnn_config = config.get('dnn_config', {})
+        dnn_mode   = dnn_config.get('dnn_mode', 'sequential')
+        print(f'[train] dnn_mode = {dnn_mode}')
 
         print(f'Collecting training data from {len(train_files)} scenarios...')
         train_feats, train_lbls = [], []
         for i, sc in enumerate(train_files, 1):
             print(f'  [{i}/{len(train_files)}] {sc}')
             f, l = _collect_scenario_data(sc, data_dir, trim_start, scale_imu,
-                                          ekf_fn, dvl_cfg, kf_cfg)
+                                          ekf_fn, dvl_cfg, kf_cfg, dnn_mode=dnn_mode)
             train_feats.append(f); train_lbls.append(l)
         all_train_features = np.concatenate(train_feats, axis=0)
         all_train_labels   = np.concatenate(train_lbls,  axis=0)
@@ -265,13 +344,13 @@ def main(config):
             for i, sc in enumerate(val_files, 1):
                 print(f'  [{i}/{len(val_files)}] {sc}')
                 f, l = _collect_scenario_data(sc, data_dir, trim_start, scale_imu,
-                                              ekf_fn, dvl_cfg, kf_cfg)
+                                              ekf_fn, dvl_cfg, kf_cfg, dnn_mode=dnn_mode)
                 val_feats.append(f); val_lbls.append(l)
             all_val_features = np.concatenate(val_feats, axis=0)
             all_val_labels   = np.concatenate(val_lbls,  axis=0)
 
         print('Training DNN velocity compensator...')
-        model, norm_stats = train_vel_compensator(
+        model, norm_stats, history = train_vel_compensator(
             all_train_features, all_train_labels, dnn_config,
             all_val_features, all_val_labels)
 
@@ -282,6 +361,20 @@ def main(config):
         save_compensator(model, norm_stats, dnn_config, model_path)
         print(f'Saved model to: {model_path}')
 
+        # Persist the train/val loss curves into a results folder named after the
+        # DNN config (so different arch/lr/mode runs don't overwrite each other).
+        train_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
+                                 f"train_{_dnn_config_token(dnn_config, kf_cfg.get('dnn_vel_SD'))}_{run_stamp}")
+        _save_training_results(history, train_dir)
+        _write_config_txt(train_dir, f"{len(train_files)} train / "
+                                     f"{len(val_files)} val scenarios",
+                          config, data_dir, kf_cfg, dvl_cfg,
+                          extra_lines=[f"model    : {model_path}",
+                                       f"mode     : {dnn_mode}",
+                                       f"final train_loss : {history['train_loss'][-1]:.6f}",
+                                       f"final val_loss   : "
+                                       f"{history['val_loss'][-1] if history['val_loss'][-1] is not None else 'N/A'}"])
+
     # =========================================================================
     # TEST DNN VELOCITY COMPENSATOR (sim or real, dispatched via data_type)
     # =========================================================================
@@ -290,17 +383,37 @@ def main(config):
         dnn_config = config.get('dnn_config', {})
         arch       = dnn_config.get('arch', 'lstm')
 
-        model_filename = _build_model_filename(data_type, dnn_config,
-                                               config.get('sim_trajectory_name'))
-        model_path = os.path.join(output_dir, 'trained_model', model_filename)
-        print(f'Loading model from: {model_path}')
-        compensator = load_compensator(model_path)
+        # Discover which mode checkpoints exist. Both modes' files are looked up
+        # by toggling 'dnn_mode' on a copy of dnn_config; whichever .pth files
+        # are present participate in the comparison.
+        modes_to_test = []
+        for mode in ('sequential', 'joint'):
+            cfg_for_mode = {**dnn_config, 'dnn_mode': mode}
+            fname = _build_model_filename(data_type, cfg_for_mode,
+                                          config.get('sim_trajectory_name'))
+            path  = os.path.join(output_dir, 'trained_model', fname)
+            if os.path.exists(path):
+                print(f'Loading {mode} model from: {path}')
+                modes_to_test.append({
+                    'mode':        mode,
+                    'cfg':         cfg_for_mode,
+                    'path':        path,
+                    'compensator': load_compensator(path),
+                })
+            else:
+                print(f'[skip] {mode} checkpoint not found at: {path}')
 
-        all_err_base, all_err_dnn_p, all_err_dnn_np = [], [], []
-        prmse_base_list,   vrmse_base_list   = [], []
-        prmse_dnn_p_list,  vrmse_dnn_p_list  = [], []
-        prmse_dnn_np_list, vrmse_dnn_np_list = [], []
-        test_scenario_names = []
+        if not modes_to_test:
+            raise FileNotFoundError(
+                "No DNN checkpoint found for either 'sequential' or 'joint' mode. "
+                "Train at least one mode first (set 'train_data': True with the "
+                "desired 'dnn_mode' in dnn_config).")
+
+        # Per-mode aggregation buckets keyed by mode name
+        prmse_by_mode = {m['mode']: [] for m in modes_to_test}
+        vrmse_by_mode = {m['mode']: [] for m in modes_to_test}
+        prmse_base_list, vrmse_base_list = [], []
+        test_scenario_names              = []
 
         active_test_files = test_files
         if data_type == 'sim' and config.get('sim_test_first_only', False):
@@ -312,101 +425,98 @@ def main(config):
             gt_t, imu_t, dvl_t = _load_scenario(data_dir, sc, trim_start, scale_imu)
             ne = imu_t.shape[0]
 
-            _, out_err_base,   out_bias_base,   out_sd_base   = ekf_fn(
+            # ---- Baseline: no DNN (one run per scenario, shared across modes) ----
+            _, out_err_base, out_bias_base, out_sd_base = ekf_fn(
                 imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg)
 
-            _, out_err_dnn_np, out_bias_dnn_np, out_sd_dnn_np = ekf_fn(
-                imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg,
-                compensator=copy.deepcopy(compensator),
-                update_P_after_dnn=False)
-
-            _, out_err_dnn_p,  out_bias_dnn_p,  out_sd_dnn_p  = ekf_fn(
-                imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg,
-                compensator=copy.deepcopy(compensator),
-                update_P_after_dnn=True)
-
-            all_err_base.append(out_err_base)
-            all_err_dnn_np.append(out_err_dnn_np)
-            all_err_dnn_p.append(out_err_dnn_p)
             test_scenario_names.append(sc)
-
             prmse_base_list.append(float(np.sqrt(np.mean(
                 out_err_base[:, 1]**2 + out_err_base[:, 2]**2 + out_err_base[:, 3]**2))))
             vrmse_base_list.append(float(np.sqrt(np.mean(
                 out_err_base[:, 4]**2 + out_err_base[:, 5]**2 + out_err_base[:, 6]**2))))
-            prmse_dnn_np_list.append(float(np.sqrt(np.mean(
-                out_err_dnn_np[:, 1]**2 + out_err_dnn_np[:, 2]**2 + out_err_dnn_np[:, 3]**2))))
-            vrmse_dnn_np_list.append(float(np.sqrt(np.mean(
-                out_err_dnn_np[:, 4]**2 + out_err_dnn_np[:, 5]**2 + out_err_dnn_np[:, 6]**2))))
-            prmse_dnn_p_list.append(float(np.sqrt(np.mean(
-                out_err_dnn_p[:, 1]**2 + out_err_dnn_p[:, 2]**2 + out_err_dnn_p[:, 3]**2))))
-            vrmse_dnn_p_list.append(float(np.sqrt(np.mean(
-                out_err_dnn_p[:, 4]**2 + out_err_dnn_p[:, 5]**2 + out_err_dnn_p[:, 6]**2))))
 
-            sc_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
-                                  f"test_{sc}_{_dnn_config_token(dnn_config, kf_cfg.get('dnn_vel_SD'))}")
-            os.makedirs(sc_dir, exist_ok=True)
-            _write_config_txt(sc_dir, sc, config, data_dir, kf_cfg, dvl_cfg,
-                              extra_lines=[f"model : {model_path}",
-                                           f"arch  : {arch}",
-                                           f"data  : {data_type}"])
+            # ---- One inference run per available mode, in its own plot folder ----
+            for entry in modes_to_test:
+                mode        = entry['mode']
+                cfg_for_mode = entry['cfg']
+                compensator = entry['compensator']
 
-            fig_pos_sc, fig_vel_sc = plot_pos_vel_two_runs(
-                out_err_base, out_sd_base, out_err_dnn_p, out_sd_dnn_p,
-                scenario=sc, arch=arch)
+                _, out_err_dnn, out_bias_dnn, out_sd_dnn = ekf_fn(
+                    imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg,
+                    compensator=copy.deepcopy(compensator),
+                    update_P_after_dnn=True,
+                    dnn_mode=mode)
 
-            if data_type == 'real':
-                # Real: IMU rate >> GT rate, so downsample errors to GT times for trajectory plot.
-                gt_times = gt_t[:, 0]
-                idx_b = np.searchsorted(out_err_base[:, 0],  gt_times).clip(0, len(out_err_base)  - 1)
-                idx_p = np.searchsorted(out_err_dnn_p[:, 0], gt_times).clip(0, len(out_err_dnn_p) - 1)
-                fig_traj_sc = plot_trajectory_two_runs(
-                    gt_t, out_err_base[idx_b], out_err_dnn_p[idx_p], scenario=sc, arch=arch)
-            else:
-                fig_traj_sc = plot_trajectory_two_runs(
-                    gt_t, out_err_base, out_err_dnn_p, scenario=sc, arch=arch)
+                prmse_by_mode[mode].append(float(np.sqrt(np.mean(
+                    out_err_dnn[:, 1]**2 + out_err_dnn[:, 2]**2 + out_err_dnn[:, 3]**2))))
+                vrmse_by_mode[mode].append(float(np.sqrt(np.mean(
+                    out_err_dnn[:, 4]**2 + out_err_dnn[:, 5]**2 + out_err_dnn[:, 6]**2))))
 
-            fig_att_sc, fig_ba_sc, fig_bg_sc = plot_att_bias_two_runs(
-                out_err_base, out_sd_base, out_bias_base,
-                out_err_dnn_p, out_sd_dnn_p, out_bias_dnn_p,
-                scenario=sc, arch=arch)
+                # Plot folder name carries the mode token so sequential and joint
+                # plots never collide.
+                sc_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
+                                      f"test_{sc}_{_dnn_config_token(cfg_for_mode, kf_cfg.get('dnn_vel_SD'))}_{run_stamp}")
+                os.makedirs(sc_dir, exist_ok=True)
+                _write_config_txt(sc_dir, sc,
+                                  {**config, 'dnn_config': cfg_for_mode},
+                                  data_dir, kf_cfg, dvl_cfg,
+                                  extra_lines=[f"model : {entry['path']}",
+                                               f"arch  : {arch}",
+                                               f"mode  : {mode}",
+                                               f"data  : {data_type}"])
 
-            fig_prmse_sc, fig_vrmse_sc = plot_prmse_vrmse_per_trajectory(
-                [sc],
-                [prmse_base_list[-1]],   [vrmse_base_list[-1]],
-                [prmse_dnn_p_list[-1]],  [vrmse_dnn_p_list[-1]],
-                arch=arch)
+                fig_pos_sc, fig_vel_sc = plot_pos_vel_two_runs(
+                    out_err_base, out_sd_base, out_err_dnn, out_sd_dnn,
+                    scenario=sc, arch=arch)
 
-            fig_pos_sc.savefig(  os.path.join(sc_dir, 'position_errors.png'), dpi=150, bbox_inches='tight')
-            fig_vel_sc.savefig(  os.path.join(sc_dir, 'velocity_errors.png'), dpi=150, bbox_inches='tight')
-            fig_traj_sc.savefig( os.path.join(sc_dir, 'trajectory.png'),      dpi=150, bbox_inches='tight')
-            fig_att_sc.savefig(  os.path.join(sc_dir, 'attitude_errors.png'), dpi=150, bbox_inches='tight')
-            fig_ba_sc.savefig(   os.path.join(sc_dir, 'accel_bias.png'),      dpi=150, bbox_inches='tight')
-            fig_bg_sc.savefig(   os.path.join(sc_dir, 'gyro_bias.png'),       dpi=150, bbox_inches='tight')
-            fig_prmse_sc.savefig(os.path.join(sc_dir, 'prmse.png'),           dpi=150, bbox_inches='tight')
-            fig_vrmse_sc.savefig(os.path.join(sc_dir, 'vrmse.png'),           dpi=150, bbox_inches='tight')
-            plt.close('all')
-            print(f'  Scenario plots saved to {sc_dir}')
+                if data_type == 'real':
+                    gt_times = gt_t[:, 0]
+                    idx_b = np.searchsorted(out_err_base[:, 0], gt_times).clip(0, len(out_err_base) - 1)
+                    idx_d = np.searchsorted(out_err_dnn[:, 0],  gt_times).clip(0, len(out_err_dnn)  - 1)
+                    fig_traj_sc = plot_trajectory_two_runs(
+                        gt_t, out_err_base[idx_b], out_err_dnn[idx_d], scenario=sc, arch=arch)
+                else:
+                    fig_traj_sc = plot_trajectory_two_runs(
+                        gt_t, out_err_base, out_err_dnn, scenario=sc, arch=arch)
+
+                fig_att_sc, fig_ba_sc, fig_bg_sc = plot_att_bias_two_runs(
+                    out_err_base, out_sd_base, out_bias_base,
+                    out_err_dnn,  out_sd_dnn,  out_bias_dnn,
+                    scenario=sc, arch=arch)
+
+                fig_prmse_sc, fig_vrmse_sc = plot_prmse_vrmse_per_trajectory(
+                    [sc],
+                    [prmse_base_list[-1]],     [vrmse_base_list[-1]],
+                    [prmse_by_mode[mode][-1]], [vrmse_by_mode[mode][-1]],
+                    arch=arch)
+
+                fig_pos_sc.savefig(  os.path.join(sc_dir, 'position_errors.png'), dpi=150, bbox_inches='tight')
+                fig_vel_sc.savefig(  os.path.join(sc_dir, 'velocity_errors.png'), dpi=150, bbox_inches='tight')
+                fig_traj_sc.savefig( os.path.join(sc_dir, 'trajectory.png'),      dpi=150, bbox_inches='tight')
+                fig_att_sc.savefig(  os.path.join(sc_dir, 'attitude_errors.png'), dpi=150, bbox_inches='tight')
+                fig_ba_sc.savefig(   os.path.join(sc_dir, 'accel_bias.png'),      dpi=150, bbox_inches='tight')
+                fig_bg_sc.savefig(   os.path.join(sc_dir, 'gyro_bias.png'),       dpi=150, bbox_inches='tight')
+                fig_prmse_sc.savefig(os.path.join(sc_dir, 'prmse.png'),           dpi=150, bbox_inches='tight')
+                fig_vrmse_sc.savefig(os.path.join(sc_dir, 'vrmse.png'),           dpi=150, bbox_inches='tight')
+                plt.close('all')
+                print(f'  [{mode}] scenario plots saved to {sc_dir}')
 
             # ----------------------------------------------------------------
-            # Real-data only: also run Nadav's EKF baseline and save a sibling
-            # folder test_<sc>_<ts>_nadav with the same standard plots
-            # (Nadav alone vs GT — no DNN comparison).
+            # Real-data only: Nadav baseline (independent of DNN mode).
+            # Gated by config 'run_nadav' (default False) so it's skipped unless
+            # explicitly requested.
             # ----------------------------------------------------------------
-            if data_type == 'real':
+            if data_type == 'real' and config.get('run_nadav', False):
                 _, out_err_n, out_bias_n, out_sd_n = lc_ins_dvl_real_nadav(
                     imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg)
 
-                # Nadav folder doesn't carry the DNN config token (Nadav doesn't use the DNN).
                 nadav_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
-                                         f"test_{sc}_nadav")
+                                         f"test_{sc}_nadav_{run_stamp}")
                 os.makedirs(nadav_dir, exist_ok=True)
                 _write_config_txt(nadav_dir, sc, config, data_dir, kf_cfg, dvl_cfg,
                                   extra_lines=[f"model : Nadav EKF baseline",
                                                f"data  : {data_type}"])
 
-                # Use the same helpers as the Guy folder so Nadav inherits the
-                # baseline colour scheme (dimgrey dashed line + grey ±σ envelope).
                 fig_pos_n, fig_vel_n = plot_pos_vel_two_runs(
                     out_err_n, out_sd_n,
                     scenario=sc, arch=arch, base_label='Nadav EKF')
@@ -414,7 +524,6 @@ def main(config):
                     out_err_n, out_sd_n, out_bias_n,
                     scenario=sc, arch=arch, base_label='Nadav EKF')
 
-                # Real data: IMU rate >> GT rate; downsample errors to GT times.
                 gt_times = gt_t[:, 0]
                 idx_n = np.searchsorted(out_err_n[:, 0], gt_times).clip(0, len(out_err_n) - 1)
                 fig_traj_n = plot_trajectory_two_runs(
@@ -430,27 +539,31 @@ def main(config):
                 plt.close('all')
                 print(f'  Nadav baseline plots saved to {nadav_dir}')
 
-        # Aggregate per-trajectory RMSE folder is only meaningful for 2+ scenarios.
-        # For a single scenario the same single-bar plot already lives inside sc_dir.
-        if len(all_err_base) >= 2:
-            fig_prmse, fig_vrmse = plot_prmse_vrmse_per_trajectory(
-                test_scenario_names,
-                prmse_base_list,   vrmse_base_list,
-                prmse_dnn_p_list,  vrmse_dnn_p_list,
-                arch=arch)
+        # Per-trajectory RMSE summary — one folder per mode (2+ scenarios only).
+        if len(test_scenario_names) >= 2:
+            for entry in modes_to_test:
+                mode         = entry['mode']
+                cfg_for_mode = entry['cfg']
+                fig_prmse, fig_vrmse = plot_prmse_vrmse_per_trajectory(
+                    test_scenario_names,
+                    prmse_base_list,         vrmse_base_list,
+                    prmse_by_mode[mode],     vrmse_by_mode[mode],
+                    arch=arch)
 
-            rmse_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
-                                    f"test_rmse_{_dnn_config_token(dnn_config, kf_cfg.get('dnn_vel_SD'))}")
-            os.makedirs(rmse_dir, exist_ok=True)
-            _write_config_txt(rmse_dir, f"{len(test_scenario_names)} test scenarios",
-                              config, data_dir, kf_cfg, dvl_cfg,
-                              extra_lines=[f"scenarios : {', '.join(test_scenario_names)}",
-                                           f"arch      : {arch}"])
-            fig_prmse.savefig(os.path.join(rmse_dir, 'prmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
-            fig_vrmse.savefig(os.path.join(rmse_dir, 'vrmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
-            plt.close(fig_prmse)
-            plt.close(fig_vrmse)
-            print(f'PRMSE/VRMSE plots saved to {rmse_dir}')
+                rmse_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
+                                        f"test_rmse_{_dnn_config_token(cfg_for_mode, kf_cfg.get('dnn_vel_SD'))}_{run_stamp}")
+                os.makedirs(rmse_dir, exist_ok=True)
+                _write_config_txt(rmse_dir, f"{len(test_scenario_names)} test scenarios",
+                                  {**config, 'dnn_config': cfg_for_mode},
+                                  data_dir, kf_cfg, dvl_cfg,
+                                  extra_lines=[f"scenarios : {', '.join(test_scenario_names)}",
+                                               f"arch      : {arch}",
+                                               f"mode      : {mode}"])
+                fig_prmse.savefig(os.path.join(rmse_dir, 'prmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
+                fig_vrmse.savefig(os.path.join(rmse_dir, 'vrmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
+                plt.close(fig_prmse)
+                plt.close(fig_vrmse)
+                print(f'  [{mode}] PRMSE/VRMSE plots saved to {rmse_dir}')
 
 
 if __name__ == '__main__':
@@ -487,6 +600,7 @@ if __name__ == '__main__':
         'train_data': False,                # train DNN on the train split
         'test_data':  True,                 # run EKF baseline + DNN on the test split
         'sim_test_first_only': True,        # sim only: limit test loop to test_files[:1]
+        'run_nadav': False,                 # real only: also run+save the Nadav EKF baseline
 
         'trim_start_seconds': 50,           # sim only
 
@@ -498,7 +612,15 @@ if __name__ == '__main__':
             'batch_size':   32,
             'epochs':      100,
             'lr':          1e-8,
-            'tag':         'lr8_traj_4_13',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix.
+            'tag':         'traj_4_13',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            # dnn_mode controls how the DNN is fused with the EKF:
+            #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
+            #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
+            #   'joint'      — DVL + DNN measurements are STACKED into a single 6-row Kalman update.
+            #                  Label = true_v_eb_n - v_ekf_pre   (residual BEFORE any measurement update).
+            # In test mode, both checkpoints (if both exist) are loaded and compared
+            # automatically — each mode writes plots into its own folder.
+            'dnn_mode':    'joint',
         },
     }
 
@@ -507,6 +629,36 @@ if __name__ == '__main__':
     # ========================================================================
     DVL_config_sim = {'epoch_interval': 0.2}
     DVL_config_real = {'epoch_interval': 1.002506}
+
+    # ========================================================================
+    # KALMAN FILTER CONFIG — REAL DATA
+    # ========================================================================
+    LC_KF_config_real = {
+
+        # Colleague conventional EKF: P0 = [0.2 m/s, 5 deg, 30 mg, 30 deg/h]
+        'init_att_unc': np.deg2rad(2.0), # deg
+        'init_vel_unc': 0.2, #m/s
+        'init_pos_unc': 5.0, # m
+        'init_b_a_unc': 1.0e-4, #micro-g
+        'init_b_g_unc': np.deg2rad(30.0) / 3600, # deg/h
+
+        'gyro_noise_PSD':  1.0e-5, # (rad/s)^2/HZ
+        'accel_noise_PSD': 1.0e-2, # (m/s)^2/HZ
+
+        'accel_bias_PSD': 1.0e-3,
+        'gyro_bias_PSD':  1.0e-6,
+
+        'vel_meas_SD': 0.5, #m/s
+        # dnn_vel_SD raised from 0.5 to down-weight the DNN in joint mode: at 0.5
+        # the DNN had equal trust to the DVL, and since the DNN measurement is
+        # correlated with the DVL (it takes dvl_v + innovation as inputs) the
+        # joint update over-corrected → accel-bias/attitude runaway → P overflow
+        # → SVD crash. Larger SD = less DNN weight = stable. Tune via sweep
+        # (2.0 → 5.0 → 10.0); EKF inference param only, no retraining needed.
+        # THIS is the line to edit when sweeping dnn_vel_SD for real data — the
+        # folder name's sd<value> token is generated from this value.
+        'dnn_vel_SD':  1.5,
+    }
 
     # ========================================================================
     # KALMAN FILTER CONFIG — SIMULATED DATA
@@ -551,30 +703,12 @@ if __name__ == '__main__':
         # dnn_vel_SD: noise assumed for the DNN correction when update_P_after_dnn=True.
         # Smaller value -> more trust in DNN -> stronger P shrinkage.
         # Start equal to vel_meas_SD and tune based on DNN correction magnitude.
-        'dnn_vel_SD': 0.5,
+        # Raised to 2.0 to match real config: in joint mode a small dnn_vel_SD
+        # over-trusts the (DVL-correlated) DNN and destabilizes the filter.
+        'dnn_vel_SD': 2.0,
     }
 
-    # ========================================================================
-    # KALMAN FILTER CONFIG — REAL DATA
-    # ========================================================================
-    LC_KF_config_real = {
 
-        # Colleague conventional EKF: P0 = [0.2 m/s, 5 deg, 30 mg, 30 deg/h]
-        'init_att_unc': np.deg2rad(2.0), # deg
-        'init_vel_unc': 0.2, #m/s
-        'init_pos_unc': 5.0, # m
-        'init_b_a_unc': 1.0e-4, #micro-g
-        'init_b_g_unc': np.deg2rad(30.0) / 3600, # deg/h
-
-        'gyro_noise_PSD':  1.0e-5, # (rad/s)^2/HZ
-        'accel_noise_PSD': 1.0e-2, # (m/s)^2/HZ
-
-        'accel_bias_PSD': 1.0e-3,
-        'gyro_bias_PSD':  1.0e-6,
-
-        'vel_meas_SD': 0.5, #m/s
-        'dnn_vel_SD':  0.5,
-    }
 
     main({**user_config,
           'dvl_cfg_sim':  DVL_config_sim,

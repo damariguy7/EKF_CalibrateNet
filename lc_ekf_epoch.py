@@ -308,6 +308,79 @@ def lc_ekf_epoch(
     return est_C_b_n_new, est_v_eb_n_new, est_L_b_new, est_lambda_b_new, est_h_b_new, est_imu_bias_new, P_matrix_new
 
 
+def lc_ekf_epoch_joint(
+        dvl_v_eb_b: np.ndarray,
+        dnn_correction: np.ndarray,
+        dnn_vel_SD: float,
+        tor_s: float,
+        est_C_b_to_n_old: np.ndarray,
+        est_v_eb_n_old: np.ndarray,
+        est_L_b_old: float,
+        est_lambda_b_old: float,
+        est_h_b_old: float,
+        est_imu_bias_old: np.ndarray,
+        P_matrix_old: np.ndarray,
+        meas_f_ib_b: np.ndarray,
+        meas_omega_ib_b: np.ndarray,
+        lc_kf_config: Dict[str, float]
+):
+    """
+    Joint DVL + DNN measurement update — single Joseph-form Kalman update that
+    fuses the body-frame DVL velocity with a DNN-provided NED-velocity error
+    estimate at the same linearization point (the predicted state).
+
+    The 6-row stacked measurement:
+        H_combined (6x15) = [ H_dvl ; H_dnn_ned_vel ]
+        R_combined (6x6 ) = blkdiag(R_dvl, dnn_vel_SD^2 * I_3)
+        delta_z   (6,  ) = [ C_b_to_n^T @ v_eb_n - dvl_v_eb_b ; -dnn_correction ]
+
+    Sign convention for the DNN row: dnn_correction is the DNN's estimate of
+    (v_true - v_predicted). The pseudo-measurement is z_dnn = v_predicted + correction,
+    and delta_z = v_nominal - z_dnn = -correction at the predicted linearization
+    point (v_nominal == v_predicted before any update).
+    """
+
+    R_N, R_E = radii_of_curvature(est_L_b_old)
+
+    x_est_propagated = np.zeros(15)
+
+    # DVL block
+    H_dvl = np.zeros((3, 15))
+    H_dvl[0:3, 0:3] = -est_C_b_to_n_old.T @ skew_symmetric(est_v_eb_n_old)
+    H_dvl[0:3, 3:6] = est_C_b_to_n_old.T
+
+    # DNN NED-velocity block (identity on velocity states)
+    H_dnn = np.zeros((3, 15))
+    H_dnn[0:3, 3:6] = np.eye(3)
+
+    H_combined = np.vstack([H_dvl, H_dnn])
+
+    R_combined = np.zeros((6, 6))
+    R_combined[0:3, 0:3] = np.eye(3) * lc_kf_config['vel_meas_SD'] ** 2
+    R_combined[3:6, 3:6] = np.eye(3) * dnn_vel_SD ** 2
+
+    P_matrix_new, K_matrix = update(P_matrix_old, H_combined, R_combined)
+
+    delta_z = np.zeros(6)
+    delta_z[0:3] = est_C_b_to_n_old.T @ est_v_eb_n_old - dvl_v_eb_b
+    delta_z[3:6] = -dnn_correction
+
+    x_est_new = x_est_propagated + K_matrix @ delta_z
+
+    # Closed-loop correction (identical to lc_ekf_epoch)
+    est_C_b_n_new = (np.eye(3) - skew_symmetric(x_est_new[0:3])) @ est_C_b_to_n_old
+    U, _, Vt = np.linalg.svd(est_C_b_n_new)
+    est_C_b_n_new = U @ Vt
+    est_v_eb_n_new = est_v_eb_n_old - x_est_new[3:6]
+
+    est_h_b_new      = est_h_b_old      - x_est_new[8]
+    est_L_b_new      = est_L_b_old      - x_est_new[6] / R_N
+    est_lambda_b_new = est_lambda_b_old - x_est_new[7] / ((R_E + est_h_b_old) * np.cos(est_L_b_old))
+
+    est_imu_bias_new = est_imu_bias_old + x_est_new[9:15]
+
+    return est_C_b_n_new, est_v_eb_n_new, est_L_b_new, est_lambda_b_new, est_h_b_new, est_imu_bias_new, P_matrix_new
+
 
 def update(P_pred, H, R):
     """

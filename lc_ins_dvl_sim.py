@@ -21,7 +21,7 @@ import navpy
 
 from matplotlib import pyplot as plt
 
-from lc_ekf_epoch import lc_ekf_epoch, update
+from lc_ekf_epoch import lc_ekf_epoch, lc_ekf_epoch_joint, update
 from euler_to_ctm import euler_to_ctm
 from initialize_ned_attitude import initialize_ned_attitude
 from ctm_to_euler import ctm_to_euler
@@ -45,6 +45,7 @@ def lc_ins_dvl_sim(
         collect_data: bool = False,
         compensator=None,
         update_P_after_dnn: bool = False,
+        dnn_mode: str = 'sequential',
 ) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
@@ -80,6 +81,10 @@ def lc_ins_dvl_sim(
     out_kf_sd : np.ndarray
         Output Kalman filter state uncertainties
     """
+
+    if dnn_mode == 'joint' and update_P_after_dnn:
+        print("[lc_ins_dvl_sim] note: update_P_after_dnn is ignored in joint mode "
+              "(P is updated jointly with the stacked DVL+DNN measurement).")
 
     # Constants
     deg_to_rad = 0.01745329252
@@ -265,35 +270,62 @@ def lc_ins_dvl_sim(
             v_ekf_pre    = est_v_eb_n.copy()
             euler_pre    = ctm_to_euler(C_nb_pre)
 
-            # Run Integration Kalman filter
-            est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
-                dvl_v_eb_b, tor_s, est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
-                meas_f_ib_b, meas_omega_ib_b, lc_kf_config
-            )
+            if dnn_mode == 'joint':
+                # Joint path: get DNN correction (if available), then run a single
+                # combined DVL+DNN Kalman update. Cold-start (first W epochs) and
+                # collect_data both fall back to DVL-only since no correction exists.
+                correction = None
+                if compensator is not None:
+                    correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
+                if correction is None:
+                    est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
+                        dvl_v_eb_b, tor_s, est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
+                        meas_f_ib_b, meas_omega_ib_b, lc_kf_config
+                    )
+                else:
+                    dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+                    est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch_joint(
+                        dvl_v_eb_b, correction, dnn_sd, tor_s, est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b,
+                        est_imu_bias, P_matrix, meas_f_ib_b, meas_omega_ib_b, lc_kf_config
+                    )
 
-            # --- DNN: apply velocity compensation (inference mode) ---
-            if compensator is not None:
-                correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
-                if correction is not None:
-                    est_v_eb_n = est_v_eb_n + correction
+                # Joint-mode label uses the pre-update residual (no DVL update applied yet)
+                if collect_data:
+                    feat  = np.concatenate([innovation, dvl_v_eb_b, v_ekf_pre, euler_pre])
+                    label = true_v_eb_n - v_ekf_pre
+                    dvl_features_list.append(feat)
+                    dvl_labels_list.append(label)
 
-                    # --- Optionally update P after DNN correction ---
-                    # Treats the DNN correction as a virtual NED-velocity measurement.
-                    # H selects velocity states (indices 3:6) directly in NED frame.
-                    # Toggle via update_P_after_dnn=True / False (default False = no change).
-                    if update_P_after_dnn:
-                        H_dnn = np.zeros((3, 15))
-                        H_dnn[0:3, 3:6] = np.eye(3)
-                        dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
-                        R_dnn = np.eye(3) * dnn_sd ** 2
-                        P_matrix, _ = update(P_matrix, H_dnn, R_dnn)
+            else:
+                # Sequential path (default, current behavior): DVL update first, then DNN.
+                est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
+                    dvl_v_eb_b, tor_s, est_C_b_to_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
+                    meas_f_ib_b, meas_omega_ib_b, lc_kf_config
+                )
 
-            # --- DNN: store training sample (collect_data mode) ---
-            if collect_data:
-                feat  = np.concatenate([innovation, dvl_v_eb_b, v_ekf_pre, euler_pre])
-                label = true_v_eb_n - est_v_eb_n          # remaining error after EKF update
-                dvl_features_list.append(feat)
-                dvl_labels_list.append(label)
+                # --- DNN: apply velocity compensation (inference mode) ---
+                if compensator is not None:
+                    correction = compensator.update(innovation, dvl_v_eb_b, v_ekf_pre, euler_pre)
+                    if correction is not None:
+                        est_v_eb_n = est_v_eb_n + correction
+
+                        # --- Optionally update P after DNN correction ---
+                        # Treats the DNN correction as a virtual NED-velocity measurement.
+                        # H selects velocity states (indices 3:6) directly in NED frame.
+                        # Toggle via update_P_after_dnn=True / False (default False = no change).
+                        if update_P_after_dnn:
+                            H_dnn = np.zeros((3, 15))
+                            H_dnn[0:3, 3:6] = np.eye(3)
+                            dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+                            R_dnn = np.eye(3) * dnn_sd ** 2
+                            P_matrix, _ = update(P_matrix, H_dnn, R_dnn)
+
+                # --- DNN: store training sample (collect_data mode) ---
+                if collect_data:
+                    feat  = np.concatenate([innovation, dvl_v_eb_b, v_ekf_pre, euler_pre])
+                    label = true_v_eb_n - est_v_eb_n          # remaining error after EKF update
+                    dvl_features_list.append(feat)
+                    dvl_labels_list.append(label)
 
             # Generate IMU bias and clock output records
             # out_imu_bias_est[epoch, 0] = time
