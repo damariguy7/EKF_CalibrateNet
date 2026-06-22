@@ -772,3 +772,65 @@ def plot_prmse_vrmse_per_trajectory(scenario_names, prmse_base, vrmse_base,
                                'Velocity RMSE [m/s]',
                                f'VRMSE per Trajectory ({n} scenarios)')
     return fig_prmse, fig_vrmse
+
+
+def plot_prmse_vrmse_per_axis(out_err_base, out_err_dnn, scenario='', arch='lstm'):
+    """
+    Two bar-chart figures showing per-axis (North/East/Down) RMSE for a single
+    trajectory: baseline EKF vs DNN, in the same style as
+    plot_prmse_vrmse_per_trajectory.
+
+        PRMSE_axis = sqrt( mean_over_time( e_axis^2 ) )   for axis in {N, E, D}
+        VRMSE_axis = sqrt( mean_over_time( ev_axis^2 ) )
+
+    Parameters
+    ----------
+    out_err_base : ndarray  baseline error array; cols [1:4]=pos N,E,D, [4:7]=vel N,E,D
+    out_err_dnn  : ndarray  DNN error array, same layout
+    scenario     : str   scenario name for the title
+    arch         : str   DNN architecture label for the legend
+
+    Returns
+    -------
+    fig_prmse, fig_vrmse : matplotlib.figure.Figure
+    """
+    axes_labels = ['North', 'East', 'Down']
+    x = np.arange(3)
+    width = 0.35
+
+    def _rmse_per_axis(err, cols):
+        return [float(np.sqrt(np.mean(err[:, c] ** 2))) for c in cols]
+
+    pos_base = _rmse_per_axis(out_err_base, [1, 2, 3])
+    pos_dnn  = _rmse_per_axis(out_err_dnn,  [1, 2, 3])
+    vel_base = _rmse_per_axis(out_err_base, [4, 5, 6])
+    vel_dnn  = _rmse_per_axis(out_err_dnn,  [4, 5, 6])
+
+    def _add_labels(ax, bars):
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f'{bar.get_height():.3f}', ha='center', va='bottom', fontsize=8)
+
+    def _make_bar_fig(base_vals, dnn_vals, ylabel, title):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        bars_base = ax.bar(x - width / 2, base_vals, width,
+                           color='dimgrey', label='Baseline EKF')
+        _add_labels(ax, bars_base)
+        bars_dnn = ax.bar(x + width / 2, dnn_vals, width,
+                          color='crimson', label=f'DNN ({arch}, P-update)')
+        _add_labels(ax, bars_dnn)
+        ax.set_xticks(x)
+        ax.set_xticklabels(axes_labels, fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, axis='y', alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    suffix = f' — {scenario}' if scenario else ''
+    fig_prmse = _make_bar_fig(pos_base, pos_dnn, 'Position RMSE [m]',
+                              f'PRMSE per Axis{suffix}')
+    fig_vrmse = _make_bar_fig(vel_base, vel_dnn, 'Velocity RMSE [m/s]',
+                              f'VRMSE per Axis{suffix}')
+    return fig_prmse, fig_vrmse

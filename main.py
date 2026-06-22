@@ -13,9 +13,10 @@ from lc_ins_dvl_real import lc_ins_dvl_real
 from lc_ins_dvl_real_nadav import lc_ins_dvl_real_nadav
 from lc_ins_dvl_sim import lc_ins_dvl_sim
 from lc_ins_dvl_sim_nadav import lc_ins_dvl_sim_nadav
-from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d, plot_trajectory_2d_comparison, plot_errors_comparison, plot_rmse_over_time, plot_pos_vel_two_runs, plot_att_bias_two_runs, plot_trajectory_two_runs, plot_prmse_vrmse_per_trajectory
+from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d, plot_trajectory_2d_comparison, plot_errors_comparison, plot_rmse_over_time, plot_pos_vel_two_runs, plot_att_bias_two_runs, plot_trajectory_two_runs, plot_prmse_vrmse_per_trajectory, plot_prmse_vrmse_per_axis
 from dnn_vel_compensator import (train_vel_compensator, save_compensator,
                                   load_compensator)
+from skew_symmetric import skew_symmetric
 
 
 # Constants
@@ -53,8 +54,16 @@ def _dnn_config_token(dnn_config, dnn_vel_sd=None):
     Pass None to omit it.
     """
     arch = dnn_config.get('arch', 'lstm')
+    # Feature-set version: fv2 = 15-dim [innovation, v_pre, euler, f_ib_b, omega_ib_b];
+    # fv3 = fv2 + 12-dim inter-epoch high-rate IMU aggregates.
+    if dnn_config.get('imu_agg_features', False):
+        _agg_set = dnn_config.get('imu_agg_set', 'full')
+        fv_token = "fv3" if _agg_set == 'full' else f"fv3{_agg_set}"
+    else:
+        fv_token = "fv2"
     parts = [
         arch,
+        fv_token,
         f"w{dnn_config.get('window_size', 10)}",
         f"h{dnn_config.get('hidden_size', 64)}",
         f"l{dnn_config.get('num_layers', 2)}",
@@ -67,6 +76,15 @@ def _dnn_config_token(dnn_config, dnn_vel_sd=None):
     mode = dnn_config.get('dnn_mode', 'sequential')
     if mode != 'sequential':
         parts.append(f"m{mode}")
+    if dnn_config.get('dnn_correct_attitude', False):
+        parts.append("att")   # Option B: 6-dim output (velocity + attitude error)
+    # Loss token: omit for plain 'mse' (backwards-compatible); 'filter' = filter-aware loss.
+    if dnn_config.get('loss_mode', 'mse') != 'mse':
+        parts.append(f"l{dnn_config.get('loss_mode')}")
+        parts.append(f"lam{str(dnn_config.get('filter_lambda', 1.0)).replace('.', 'p')}")
+        if dnn_config.get('filter_horizon', 1) > 1:
+            parts.append(f"hz{dnn_config.get('filter_horizon')}")
+            parts.append(f"ld{str(dnn_config.get('filter_lambda_drift', 1.0)).replace('.', 'p')}")
     parts.append(_lr_token(dnn_config.get('lr', 1e-3)))
     tag = dnn_config.get('tag', '')
     if tag:
@@ -74,18 +92,27 @@ def _dnn_config_token(dnn_config, dnn_vel_sd=None):
     return '_'.join(parts)
 
 
-def _build_model_filename(data_type, dnn_config, sim_trajectory_name):
+def _build_model_filename(data_type, dnn_config, sim_trajectory_name, dnn_vel_sd=None):
     """Build the .pth filename for the DNN compensator from training context.
 
-    sim:  vel_compensator_sim_<arch>_<traj>_w<W>_h<H>_l<L>_e<E>[_<tag>].pth
-    real: vel_compensator_real_<arch>_w<W>_h<H>_l<L>_e<E>[_<tag>].pth
+    sim:  vel_compensator_sim_<arch>_fv2_<traj>_w<W>_h<H>_l<L>_e<E>[...].pth
+    real: vel_compensator_real_<arch>_fv2_w<W>_h<H>_l<L>_e<E>[...].pth
 
+    `fv2` marks the 15-dim feature set; it is always present now and keeps new
+    checkpoints from colliding with / mis-loading the old 12-dim ones.
+    For the filter-aware loss the name also carries `lfilter` and the training
+    `dnn_vel_SD` (the loss bakes that gain), so a filter model is tied to its SD.
     Underscores inside the trajectory name are replaced with dashes so
     underscore stays a clean field separator. Empty/missing tag drops the
     trailing _<tag> segment.
     """
     arch = dnn_config.get('arch', 'lstm')
-    parts = ['vel_compensator', data_type, arch]
+    if dnn_config.get('imu_agg_features', False):
+        _agg_set = dnn_config.get('imu_agg_set', 'full')
+        fv_token = "fv3" if _agg_set == 'full' else f"fv3{_agg_set}"
+    else:
+        fv_token = "fv2"
+    parts = ['vel_compensator', data_type, arch, fv_token]
     if data_type == 'sim':
         traj_token = (sim_trajectory_name or 'unknown').replace('_', '-')
         parts.append(traj_token)
@@ -99,6 +126,18 @@ def _build_model_filename(data_type, dnn_config, sim_trajectory_name):
     mode = dnn_config.get('dnn_mode', 'sequential')
     if mode != 'sequential':
         parts.append(f"m{mode}")
+    if dnn_config.get('dnn_correct_attitude', False):
+        parts.append("att")   # Option B: 6-dim output (velocity + attitude error)
+    # Loss token + baked SD + lambda: only for the filter-aware loss (mse keeps
+    # SD-free names, since an mse-trained model is SD-agnostic at inference).
+    if dnn_config.get('loss_mode', 'mse') != 'mse':
+        parts.append(f"l{dnn_config.get('loss_mode')}")
+        if dnn_vel_sd is not None:
+            parts.append(f"sd{str(dnn_vel_sd).replace('.', 'p')}")
+        parts.append(f"lam{str(dnn_config.get('filter_lambda', 1.0)).replace('.', 'p')}")
+        if dnn_config.get('filter_horizon', 1) > 1:
+            parts.append(f"hz{dnn_config.get('filter_horizon')}")
+            parts.append(f"ld{str(dnn_config.get('filter_lambda_drift', 1.0)).replace('.', 'p')}")
     parts.append(_lr_token(dnn_config.get('lr', 1e-3)))
     tag = dnn_config.get('tag', '')
     if tag:
@@ -186,18 +225,105 @@ def _load_scenario(data_dir, name, trim_start, scale_imu):
     return gt, imu, dvl
 
 
+def _trim_end_seconds(gt, imu, dvl, seconds):
+    """Drop the last `seconds` of data from a scenario's GT/IMU/DVL arrays.
+
+    The cutoff is a single absolute time computed from the scenario's overall
+    end (max time across the three sources) minus `seconds`; every array is
+    filtered to times <= that cutoff so they stay aligned to the same end.
+    Times are NOT shifted. seconds <= 0 is a no-op.
+    """
+    if not seconds or seconds <= 0:
+        return gt, imu, dvl
+    t_end = max(gt[:, 0].max(), imu[:, 0].max(), dvl[:, 0].max()) - seconds
+    gt  = gt[gt[:, 0]   <= t_end]
+    imu = imu[imu[:, 0] <= t_end]
+    dvl = dvl[dvl[:, 0] <= t_end]
+    return gt, imu, dvl
+
+
+def _precompute_filter_targets(aux, vel_meas_SD, dnn_vel_SD, dnn_mode='joint'):
+    """Build the affine post-update-velocity map v_post = c + A @ correction for
+    the filter-aware / drift loss. A, c depend only on (P, H, R) — not on the DNN
+    output — so they are constants the loss differentiates the correction through.
+
+    joint:      single 6-row DVL+DNN update (mirrors lc_ekf_epoch_joint).
+                aux is a-priori: v_pre, C_b_n, P_pred, dvl_v.
+                A = K[3:6,3:6];  c = v_pre - K[3:6,0:3] @ (C^T v_pre - dvl_v).
+    sequential: the velocity-only DNN update applied AFTER the DVL update.
+                aux is POST-DVL: v_pre = post-DVL velocity (= c), P_pred = post-DVL P.
+                K_dnn = P Hvel^T (Hvel P Hvel^T + R_dnn)^-1, Hvel = I on vel states.
+                v_post = v_postDVL + K_dnn[3:6,:] @ correction → A = K_dnn[3:6,:], c = v_postDVL.
+
+    Returns A (N,3,3), c (N,3), v_true (N,3).
+    """
+    v_pre  = aux['v_pre']      # (N,3)  pre-update (joint) / post-DVL (sequential)
+    v_true = aux['v_true']     # (N,3)
+    P      = aux['P_pred']     # (N,15,15)
+    N = v_pre.shape[0]
+    A = np.zeros((N, 3, 3))
+    c = np.zeros((N, 3))
+
+    if dnn_mode == 'sequential':
+        R_dnn = np.eye(3) * dnn_vel_SD ** 2
+        for i in range(N):
+            Pi = P[i]
+            S = Pi[3:6, 3:6] + R_dnn
+            K_dnn = Pi[:, 3:6] @ np.linalg.inv(S)   # (15,3)
+            A[i] = K_dnn[3:6, :]
+            c[i] = v_pre[i]                          # post-DVL velocity
+        return A, c, v_true
+
+    # joint
+    C     = aux['C_b_n']      # (N,3,3)
+    dvl_v = aux['dvl_v']      # (N,3)
+    H_dnn = np.zeros((3, 15))
+    H_dnn[0:3, 3:6] = np.eye(3)
+    R = np.zeros((6, 6))
+    R[0:3, 0:3] = np.eye(3) * vel_meas_SD ** 2
+    R[3:6, 3:6] = np.eye(3) * dnn_vel_SD ** 2
+    for i in range(N):
+        Ci = C[i]
+        H_dvl = np.zeros((3, 15))
+        H_dvl[0:3, 0:3] = -Ci.T @ skew_symmetric(v_pre[i])
+        H_dvl[0:3, 3:6] = Ci.T
+        H = np.vstack([H_dvl, H_dnn])
+        S = H @ P[i] @ H.T + R
+        K = P[i] @ H.T @ np.linalg.inv(S)         # (15,6)
+        Kv = K[3:6, :]                             # (3,6) velocity rows
+        delta_z_dvl = Ci.T @ v_pre[i] - dvl_v[i]   # (3,)
+        A[i] = Kv[:, 3:6]
+        c[i] = v_pre[i] - Kv[:, 0:3] @ delta_z_dvl
+    return A, c, v_true
+
+
 def _collect_scenario_data(name, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
-                           dnn_mode='sequential'):
+                           dnn_mode='sequential', capture_aux=False, correct_attitude=False,
+                           imu_agg_features=False, imu_agg_set='full'):
     """Run one scenario through the EKF in collect mode, return (features, labels).
 
     `dnn_mode` selects the label expression: 'sequential' yields the post-DVL
     residual, 'joint' yields the pre-DVL residual (the target a DNN co-fused
     with DVL in a single Kalman update must learn).
+
+    When `capture_aux=True` (joint mode, for the filter-aware loss), also returns
+    a per-epoch aux dict (v_pre/v_true/C_b_n/P_pred/dvl_v) → (features, labels, aux).
+    `correct_attitude=True` (Option B) appends a 3-dim attitude-error block to the
+    label → 6-dim labels. `imu_agg_features=True` (fv3) appends 12-dim inter-epoch
+    high-rate IMU aggregates to the feature → 27-dim features.
     """
     gt, imu, dvl = _load_scenario(data_dir, name, trim_start, scale_imu)
+    if capture_aux:
+        _, _, _, _, features, labels, aux = ekf_fn(
+            imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg,
+            collect_data=True, dnn_mode=dnn_mode, capture_aux=True,
+            correct_attitude=correct_attitude, imu_agg_features=imu_agg_features,
+            imu_agg_set=imu_agg_set)
+        return features, labels, aux
     _, _, _, _, features, labels = ekf_fn(
         imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg,
-        collect_data=True, dnn_mode=dnn_mode)
+        collect_data=True, dnn_mode=dnn_mode, correct_attitude=correct_attitude,
+        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set)
     return features, labels
 
 
@@ -325,37 +451,70 @@ def main(config):
     if config['train_data']:
         dnn_config = config.get('dnn_config', {})
         dnn_mode   = dnn_config.get('dnn_mode', 'sequential')
-        print(f'[train] dnn_mode = {dnn_mode}')
+        loss_mode  = dnn_config.get('loss_mode', 'mse')
+        print(f'[train] dnn_mode = {dnn_mode}   loss_mode = {loss_mode}')
+
+        # Filter-aware / drift loss needs the per-epoch EKF state captured during
+        # collection (joint: a-priori; sequential: post-DVL).
+        capture_aux = (loss_mode == 'filter')
+        if capture_aux and dnn_mode not in ('joint', 'sequential'):
+            raise ValueError(f"loss_mode='filter' not supported for dnn_mode='{dnn_mode}'.")
+        # Option B: 6-dim (velocity + attitude) labels. The filter-aware loss is
+        # velocity-only for now, so attitude correction uses plain MSE.
+        correct_attitude = dnn_config.get('dnn_correct_attitude', False)
+        if correct_attitude and loss_mode == 'filter':
+            raise ValueError("dnn_correct_attitude currently supports loss_mode='mse' only "
+                             "(filter-aware loss does not yet cover the attitude block).")
+        vel_meas_SD = kf_cfg.get('vel_meas_SD')
+        dnn_vel_SD  = kf_cfg.get('dnn_vel_SD', vel_meas_SD)
+        # fv3: high-rate inter-epoch IMU aggregates appended to the feature.
+        imu_agg_features = dnn_config.get('imu_agg_features', False)
+        imu_agg_set = dnn_config.get('imu_agg_set', 'full')
+
+        def _collect_split(files):
+            """Collect features/labels (and, if capture_aux, filter targets) over a file list."""
+            feats, lbls, auxes = [], [], []
+            for i, sc in enumerate(files, 1):
+                print(f'  [{i}/{len(files)}] {sc}')
+                if capture_aux:
+                    f, l, aux = _collect_scenario_data(
+                        sc, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
+                        dnn_mode=dnn_mode, capture_aux=True, correct_attitude=correct_attitude,
+                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set)
+                    auxes.append(aux)
+                else:
+                    f, l = _collect_scenario_data(
+                        sc, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
+                        dnn_mode=dnn_mode, correct_attitude=correct_attitude,
+                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set)
+                feats.append(f); lbls.append(l)
+            features = np.concatenate(feats, axis=0)
+            labels   = np.concatenate(lbls,  axis=0)
+            targets = None
+            if capture_aux:
+                aux_all = {k: np.concatenate([a[k] for a in auxes], axis=0)
+                           for k in auxes[0]}
+                targets = _precompute_filter_targets(aux_all, vel_meas_SD, dnn_vel_SD,
+                                                     dnn_mode=dnn_mode)
+            return features, labels, targets
 
         print(f'Collecting training data from {len(train_files)} scenarios...')
-        train_feats, train_lbls = [], []
-        for i, sc in enumerate(train_files, 1):
-            print(f'  [{i}/{len(train_files)}] {sc}')
-            f, l = _collect_scenario_data(sc, data_dir, trim_start, scale_imu,
-                                          ekf_fn, dvl_cfg, kf_cfg, dnn_mode=dnn_mode)
-            train_feats.append(f); train_lbls.append(l)
-        all_train_features = np.concatenate(train_feats, axis=0)
-        all_train_labels   = np.concatenate(train_lbls,  axis=0)
+        all_train_features, all_train_labels, train_targets = _collect_split(train_files)
 
-        all_val_features, all_val_labels = None, None
+        all_val_features, all_val_labels, val_targets = None, None, None
         if val_files:
             print(f'Collecting validation data from {len(val_files)} scenarios...')
-            val_feats, val_lbls = [], []
-            for i, sc in enumerate(val_files, 1):
-                print(f'  [{i}/{len(val_files)}] {sc}')
-                f, l = _collect_scenario_data(sc, data_dir, trim_start, scale_imu,
-                                              ekf_fn, dvl_cfg, kf_cfg, dnn_mode=dnn_mode)
-                val_feats.append(f); val_lbls.append(l)
-            all_val_features = np.concatenate(val_feats, axis=0)
-            all_val_labels   = np.concatenate(val_lbls,  axis=0)
+            all_val_features, all_val_labels, val_targets = _collect_split(val_files)
 
         print('Training DNN velocity compensator...')
         model, norm_stats, history = train_vel_compensator(
             all_train_features, all_train_labels, dnn_config,
-            all_val_features, all_val_labels)
+            all_val_features, all_val_labels,
+            loss_mode=loss_mode, train_targets=train_targets, val_targets=val_targets)
 
         model_filename = _build_model_filename(data_type, dnn_config,
-                                               config.get('sim_trajectory_name'))
+                                               config.get('sim_trajectory_name'),
+                                               dnn_vel_sd=dnn_vel_SD)
         model_path = os.path.join(output_dir, 'trained_model', model_filename)
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         save_compensator(model, norm_stats, dnn_config, model_path)
@@ -363,7 +522,7 @@ def main(config):
 
         # Persist the train/val loss curves into a results folder named after the
         # DNN config (so different arch/lr/mode runs don't overwrite each other).
-        train_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
+        train_dir = os.path.join(output_dir, 'plots', 'trains',
                                  f"train_{_dnn_config_token(dnn_config, kf_cfg.get('dnn_vel_SD'))}_{run_stamp}")
         _save_training_results(history, train_dir)
         _write_config_txt(train_dir, f"{len(train_files)} train / "
@@ -390,7 +549,8 @@ def main(config):
         for mode in ('sequential', 'joint'):
             cfg_for_mode = {**dnn_config, 'dnn_mode': mode}
             fname = _build_model_filename(data_type, cfg_for_mode,
-                                          config.get('sim_trajectory_name'))
+                                          config.get('sim_trajectory_name'),
+                                          dnn_vel_sd=kf_cfg.get('dnn_vel_SD'))
             path  = os.path.join(output_dir, 'trained_model', fname)
             if os.path.exists(path):
                 print(f'Loading {mode} model from: {path}')
@@ -420,9 +580,17 @@ def main(config):
             active_test_files = test_files[:1]
             print(f'[sim] sim_test_first_only=True → testing only {active_test_files}')
 
-        for sc in active_test_files:
-            print(f'Testing {data_type} scenario: {sc}')
+        # Optional per-test-trajectory tail trim: test_trim_end_seconds[i] cuts the
+        # last i-th seconds off the i-th test trajectory (by position). Shorter
+        # list / missing entries → no trim for those trajectories.
+        test_trim_end = config.get('test_trim_end_seconds', [])
+
+        for i_sc, sc in enumerate(active_test_files):
+            trim_end = test_trim_end[i_sc] if i_sc < len(test_trim_end) else 0
+            print(f'Testing {data_type} scenario: {sc}'
+                  + (f' (trim last {trim_end}s)' if trim_end else ''))
             gt_t, imu_t, dvl_t = _load_scenario(data_dir, sc, trim_start, scale_imu)
+            gt_t, imu_t, dvl_t = _trim_end_seconds(gt_t, imu_t, dvl_t, trim_end)
             ne = imu_t.shape[0]
 
             # ---- Baseline: no DNN (one run per scenario, shared across modes) ----
@@ -435,6 +603,14 @@ def main(config):
             vrmse_base_list.append(float(np.sqrt(np.mean(
                 out_err_base[:, 4]**2 + out_err_base[:, 5]**2 + out_err_base[:, 6]**2))))
 
+            # Baseline attitude error (deg) — is traj position error heading-limited?
+            # out_err cols 7,8,9 = roll,pitch,yaw error (rad). Report RMSE + yaw bias.
+            _att = out_err_base[:, 7:10] * rad_to_deg
+            _yaw_rmse = float(np.sqrt(np.mean(_att[:, 2]**2)))
+            _yaw_bias = float(np.mean(_att[:, 2]))
+            print(f"  [att] {sc} baseline yaw RMSE={_yaw_rmse:.3f} deg (bias={_yaw_bias:+.3f}); "
+                  f"roll RMSE={np.sqrt(np.mean(_att[:,0]**2)):.3f}, pitch RMSE={np.sqrt(np.mean(_att[:,1]**2)):.3f}")
+
             # ---- One inference run per available mode, in its own plot folder ----
             for entry in modes_to_test:
                 mode        = entry['mode']
@@ -445,12 +621,41 @@ def main(config):
                     imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg,
                     compensator=copy.deepcopy(compensator),
                     update_P_after_dnn=True,
-                    dnn_mode=mode)
+                    dnn_mode=mode,
+                    imu_agg_features=cfg_for_mode.get('imu_agg_features', False),
+                    imu_agg_set=cfg_for_mode.get('imu_agg_set', 'full'))
 
                 prmse_by_mode[mode].append(float(np.sqrt(np.mean(
                     out_err_dnn[:, 1]**2 + out_err_dnn[:, 2]**2 + out_err_dnn[:, 3]**2))))
                 vrmse_by_mode[mode].append(float(np.sqrt(np.mean(
                     out_err_dnn[:, 4]**2 + out_err_dnn[:, 5]**2 + out_err_dnn[:, 6]**2))))
+
+                # Console comparison so the benefit (or not) is visible without
+                # opening the plots: baseline vs this mode, per scenario.
+                _pb, _vb = prmse_base_list[-1], vrmse_base_list[-1]
+                _pm, _vm = prmse_by_mode[mode][-1], vrmse_by_mode[mode][-1]
+                print(f"  [{mode}] {sc}: "
+                      f"PRMSE {_pb:.3f} -> {_pm:.3f} m ({100*(_pm-_pb)/_pb:+.1f}%)   "
+                      f"VRMSE {_vb:.4f} -> {_vm:.4f} m/s ({100*(_vm-_vb)/_vb:+.1f}%)")
+
+                # Turn-rate error slice: does the DNN help during maneuvers? Bucket
+                # epochs by gyro magnitude ||omega|| (imu cols 4:6, rad/s); compare
+                # baseline vs mode velocity RMSE in the high-turn (top quartile) vs
+                # low-turn buckets. (GT held within intervals affects both equally,
+                # so the baseline-vs-mode comparison per bucket is still meaningful.)
+                _wmag = np.linalg.norm(imu_t[:out_err_base.shape[0], 4:7], axis=1)
+                _thr = np.percentile(_wmag, 75)
+                _hi = _wmag > _thr
+                _veb = np.sqrt(out_err_base[:, 4]**2 + out_err_base[:, 5]**2 + out_err_base[:, 6]**2)
+                _vem = np.sqrt(out_err_dnn[:, 4]**2 + out_err_dnn[:, 5]**2 + out_err_dnn[:, 6]**2)
+
+                def _rmse(a, m):
+                    return float(np.sqrt(np.mean(a[m]**2))) if m.any() else float('nan')
+                _hb, _hm = _rmse(_veb, _hi), _rmse(_vem, _hi)
+                _lb, _lm = _rmse(_veb, ~_hi), _rmse(_vem, ~_hi)
+                print(f"        turn-slice VRMSE  high(>{np.rad2deg(_thr):.0f}deg/s): "
+                      f"{_hb:.4f}->{_hm:.4f} ({100*(_hm-_hb)/_hb:+.1f}%)   "
+                      f"low: {_lb:.4f}->{_lm:.4f} ({100*(_lm-_lb)/_lb:+.1f}%)")
 
                 # Plot folder name carries the mode token so sequential and joint
                 # plots never collide.
@@ -463,7 +668,8 @@ def main(config):
                                   extra_lines=[f"model : {entry['path']}",
                                                f"arch  : {arch}",
                                                f"mode  : {mode}",
-                                               f"data  : {data_type}"])
+                                               f"data  : {data_type}",
+                                               f"trim_end_seconds : {trim_end}"])
 
                 fig_pos_sc, fig_vel_sc = plot_pos_vel_two_runs(
                     out_err_base, out_sd_base, out_err_dnn, out_sd_dnn,
@@ -490,6 +696,9 @@ def main(config):
                     [prmse_by_mode[mode][-1]], [vrmse_by_mode[mode][-1]],
                     arch=arch)
 
+                fig_prmse_axis, fig_vrmse_axis = plot_prmse_vrmse_per_axis(
+                    out_err_base, out_err_dnn, scenario=sc, arch=arch)
+
                 fig_pos_sc.savefig(  os.path.join(sc_dir, 'position_errors.png'), dpi=150, bbox_inches='tight')
                 fig_vel_sc.savefig(  os.path.join(sc_dir, 'velocity_errors.png'), dpi=150, bbox_inches='tight')
                 fig_traj_sc.savefig( os.path.join(sc_dir, 'trajectory.png'),      dpi=150, bbox_inches='tight')
@@ -498,6 +707,8 @@ def main(config):
                 fig_bg_sc.savefig(   os.path.join(sc_dir, 'gyro_bias.png'),       dpi=150, bbox_inches='tight')
                 fig_prmse_sc.savefig(os.path.join(sc_dir, 'prmse.png'),           dpi=150, bbox_inches='tight')
                 fig_vrmse_sc.savefig(os.path.join(sc_dir, 'vrmse.png'),           dpi=150, bbox_inches='tight')
+                fig_prmse_axis.savefig(os.path.join(sc_dir, 'prmse_per_axis.png'), dpi=150, bbox_inches='tight')
+                fig_vrmse_axis.savefig(os.path.join(sc_dir, 'vrmse_per_axis.png'), dpi=150, bbox_inches='tight')
                 plt.close('all')
                 print(f'  [{mode}] scenario plots saved to {sc_dir}')
 
@@ -539,32 +750,6 @@ def main(config):
                 plt.close('all')
                 print(f'  Nadav baseline plots saved to {nadav_dir}')
 
-        # Per-trajectory RMSE summary — one folder per mode (2+ scenarios only).
-        if len(test_scenario_names) >= 2:
-            for entry in modes_to_test:
-                mode         = entry['mode']
-                cfg_for_mode = entry['cfg']
-                fig_prmse, fig_vrmse = plot_prmse_vrmse_per_trajectory(
-                    test_scenario_names,
-                    prmse_base_list,         vrmse_base_list,
-                    prmse_by_mode[mode],     vrmse_by_mode[mode],
-                    arch=arch)
-
-                rmse_dir = os.path.join(output_dir, 'plots', f'{data_type}_results',
-                                        f"test_rmse_{_dnn_config_token(cfg_for_mode, kf_cfg.get('dnn_vel_SD'))}_{run_stamp}")
-                os.makedirs(rmse_dir, exist_ok=True)
-                _write_config_txt(rmse_dir, f"{len(test_scenario_names)} test scenarios",
-                                  {**config, 'dnn_config': cfg_for_mode},
-                                  data_dir, kf_cfg, dvl_cfg,
-                                  extra_lines=[f"scenarios : {', '.join(test_scenario_names)}",
-                                               f"arch      : {arch}",
-                                               f"mode      : {mode}"])
-                fig_prmse.savefig(os.path.join(rmse_dir, 'prmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
-                fig_vrmse.savefig(os.path.join(rmse_dir, 'vrmse_per_trajectory.png'), dpi=150, bbox_inches='tight')
-                plt.close(fig_prmse)
-                plt.close(fig_vrmse)
-                print(f'  [{mode}] PRMSE/VRMSE plots saved to {rmse_dir}')
-
 
 if __name__ == '__main__':
 
@@ -592,12 +777,17 @@ if __name__ == '__main__':
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory4','trajectory13'],
+        'real_test_files': ['trajectory10', 'trajectory12'],
+
+        # Cut the last N seconds off each test trajectory, by position:
+        # [0] → first test trajectory, [1] → second, etc. 0 (or a missing entry)
+        # = no trim. Applies to whatever the active test split is (sim or real).
+        'test_trim_end_seconds': [0, 0],
 
         'split_seed': 42,                   # RNG seed for reproducible auto-splits
 
         # Mode flags
-        'train_data': False,                # train DNN on the train split
+        'train_data': True,                 # train DNN on the train split
         'test_data':  True,                 # run EKF baseline + DNN on the test split
         'sim_test_first_only': True,        # sim only: limit test loop to test_files[:1]
         'run_nadav': False,                 # real only: also run+save the Nadav EKF baseline
@@ -611,8 +801,9 @@ if __name__ == '__main__':
             'num_layers':    2,
             'batch_size':   32,
             'epochs':      100,
-            'lr':          1e-8,
-            'tag':         'traj_4_13',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'lr':          1e-3,
+            'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run.
+            'tag':         'traj_10_12',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
@@ -620,7 +811,39 @@ if __name__ == '__main__':
             #                  Label = true_v_eb_n - v_ekf_pre   (residual BEFORE any measurement update).
             # In test mode, both checkpoints (if both exist) are loaded and compared
             # automatically — each mode writes plots into its own folder.
-            'dnn_mode':    'joint',
+            'dnn_mode':    'sequential',
+            # loss_mode controls the TRAINING objective:
+            #   'mse'    — plain MSE on the normalised velocity-error label (default).
+            #   'filter' — filter-aware loss on the NED velocity AFTER the joint Kalman
+            #              update (single-step). JOINT ONLY; the loss bakes the current
+            #              dnn_vel_SD, so train at the SD you intend to test at. Encoded
+            #              in the checkpoint name as lfilter_sd<SD>.
+            'loss_mode':   'mse',
+            # Option B: also estimate & correct attitude error (6-dim output:
+            # [velocity(3), euler(3)]). Targets the heading-driven position drift
+            # that velocity-only correction can't fix. Joint-only; MSE loss only.
+            # Name token 'att'; attitude trust set by dnn_att_SD in LC_KF_config_real.
+            'dnn_correct_attitude': False,
+            # (sequential drift-loss run: loss_mode='filter' + filter_horizon>1 trains
+            #  the velocity-only sequential model to minimise accumulated drift → PRMSE.)
+            # filter_lambda weights the filter-aware term vs the velocity-error
+            # anchor in the blended loss: L = ||corr-(v_true-v_pre)||^2 + lambda*||v_post-v_true||^2.
+            # lambda=0 == plain MSE (safe floor); raise for more filter influence.
+            'filter_lambda': 1.0,
+            # Multi-step (drift) loss: filter_horizon>1 trains over H consecutive epochs
+            # and adds lambda_drift*||mean_h(v_post-v_true)||^2 — penalises the persistent
+            # velocity bias that integrates into POSITION drift (targets PRMSE, not just VRMSE).
+            # horizon=1 disables it (pure single-step). Name tokens: hz<H>_ld<drift>.
+            'filter_horizon': 20,
+            'filter_lambda_drift': 1.0,
+            # Phase A (fv3): append 12-dim inter-epoch high-rate IMU aggregates
+            # [Δθ(3), Δv(3), std(ω)(3), std(f)(3)] to the 15-dim feature → 27-dim,
+            # to capture maneuvers the 1 Hz EKF state smooths away. False = fv2.
+            # Distinct checkpoint name (fv3 token) — fv2 models are preserved.
+            'imu_agg_features': False,
+            # Which aggregates: 'full' = [Δθ,Δv,std(ω),std(f)] (12-dim, fv3);
+            # 'dtheta' = just Δθ (3-dim, fv3dtheta) — the lean ablation.
+            'imu_agg_set': 'dtheta',
         },
     }
 
@@ -657,7 +880,24 @@ if __name__ == '__main__':
         # (2.0 → 5.0 → 10.0); EKF inference param only, no retraining needed.
         # THIS is the line to edit when sweeping dnn_vel_SD for real data — the
         # folder name's sd<value> token is generated from this value.
-        'dnn_vel_SD':  1.5,
+        # NOTE: filter-loss models BAKE this SD (checkpoint name carries sd<value>),
+        # so changing it requires retraining (cheap — no re-collection). 1.5 diverged
+        # at inference (SVD); 2.5 is a stable starting point, sweep down toward 2.0.
+        'dnn_vel_SD':  2.5,
+        # Adaptive DNN gate (inference-only, no retraining): scale the correction by
+        # g = m^2/(m^2+tau^2), m=||innovation||. Suppresses the DNN where EKF<->DVL
+        # agree (accurate trajectories). Measured mean ||innov||: traj4~0.097 (help),
+        # traj13~0.030 (harm). tau between them gates traj13 off but keeps traj4.
+        # None/0 = gate off. Sweep this freely with test-only runs.
+        # dnn_gate_pow: steepness of the on/off transition (higher = sharper).
+        # tau=0.07 = median baseline ||innovation|| over the 11 train/val trajectories
+        # (principled, not tuned on the test pair).
+        'dnn_gate_tau': 0.07,
+        'dnn_gate_pow': 4,
+        # Option B attitude-pseudo-measurement noise SD (rad). Trust on the DNN's
+        # attitude-error estimate in the joint update. Inference-only for MSE models
+        # (not baked) → sweepable test-only. Smaller = trust the DNN heading more.
+        'dnn_att_SD': np.deg2rad(180.0),
     }
 
     # ========================================================================

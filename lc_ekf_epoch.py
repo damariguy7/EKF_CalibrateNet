@@ -322,22 +322,26 @@ def lc_ekf_epoch_joint(
         P_matrix_old: np.ndarray,
         meas_f_ib_b: np.ndarray,
         meas_omega_ib_b: np.ndarray,
-        lc_kf_config: Dict[str, float]
+        lc_kf_config: Dict[str, float],
+        dnn_att_correction: np.ndarray = None,
+        dnn_att_SD: float = None
 ):
     """
     Joint DVL + DNN measurement update — single Joseph-form Kalman update that
     fuses the body-frame DVL velocity with a DNN-provided NED-velocity error
     estimate at the same linearization point (the predicted state).
 
-    The 6-row stacked measurement:
-        H_combined (6x15) = [ H_dvl ; H_dnn_ned_vel ]
-        R_combined (6x6 ) = blkdiag(R_dvl, dnn_vel_SD^2 * I_3)
-        delta_z   (6,  ) = [ C_b_to_n^T @ v_eb_n - dvl_v_eb_b ; -dnn_correction ]
+    The stacked measurement (6 rows, or 9 with the optional attitude block):
+        H_combined = [ H_dvl ; H_dnn_ned_vel (; H_dnn_att) ]
+        R_combined = blkdiag(R_dvl, dnn_vel_SD^2 I_3 (, dnn_att_SD^2 I_3))
+        delta_z    = [ C_b_to_n^T @ v_eb_n - dvl_v_eb_b ; -dnn_correction (; -dnn_att_correction) ]
 
-    Sign convention for the DNN row: dnn_correction is the DNN's estimate of
-    (v_true - v_predicted). The pseudo-measurement is z_dnn = v_predicted + correction,
-    and delta_z = v_nominal - z_dnn = -correction at the predicted linearization
-    point (v_nominal == v_predicted before any update).
+    Sign convention for the DNN rows: the corrections are the DNN's estimate of
+    (true - predicted), so delta_z = nominal - pseudo-measurement = -correction at
+    the predicted linearization point. The attitude block (Option B) directly
+    observes the attitude-error state (H_att = I_3 on states 0:3); its label is
+    delta_eul = -ctm_to_euler(est_C @ true_C^T), matching the closed-loop
+    correction est_C_new = (I - skew(x[0:3])) est_C.
     """
 
     R_N, R_E = radii_of_curvature(est_L_b_old)
@@ -353,15 +357,27 @@ def lc_ekf_epoch_joint(
     H_dnn = np.zeros((3, 15))
     H_dnn[0:3, 3:6] = np.eye(3)
 
-    H_combined = np.vstack([H_dvl, H_dnn])
-
-    R_combined = np.zeros((6, 6))
-    R_combined[0:3, 0:3] = np.eye(3) * lc_kf_config['vel_meas_SD'] ** 2
-    R_combined[3:6, 3:6] = np.eye(3) * dnn_vel_SD ** 2
+    use_att = dnn_att_correction is not None
+    if use_att:
+        # DNN attitude block (identity on attitude-error states 0:3)
+        H_att = np.zeros((3, 15))
+        H_att[0:3, 0:3] = np.eye(3)
+        H_combined = np.vstack([H_dvl, H_dnn, H_att])
+        R_combined = np.zeros((9, 9))
+        R_combined[0:3, 0:3] = np.eye(3) * lc_kf_config['vel_meas_SD'] ** 2
+        R_combined[3:6, 3:6] = np.eye(3) * dnn_vel_SD ** 2
+        R_combined[6:9, 6:9] = np.eye(3) * dnn_att_SD ** 2
+        delta_z = np.zeros(9)
+        delta_z[6:9] = -dnn_att_correction
+    else:
+        H_combined = np.vstack([H_dvl, H_dnn])
+        R_combined = np.zeros((6, 6))
+        R_combined[0:3, 0:3] = np.eye(3) * lc_kf_config['vel_meas_SD'] ** 2
+        R_combined[3:6, 3:6] = np.eye(3) * dnn_vel_SD ** 2
+        delta_z = np.zeros(6)
 
     P_matrix_new, K_matrix = update(P_matrix_old, H_combined, R_combined)
 
-    delta_z = np.zeros(6)
     delta_z[0:3] = est_C_b_to_n_old.T @ est_v_eb_n_old - dvl_v_eb_b
     delta_z[3:6] = -dnn_correction
 
