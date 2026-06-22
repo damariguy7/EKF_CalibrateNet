@@ -802,7 +802,7 @@ if __name__ == '__main__':
             'batch_size':   32,
             'epochs':      100,
             'lr':          1e-3,
-            'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run.
+            'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
             'tag':         'traj_10_12',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
