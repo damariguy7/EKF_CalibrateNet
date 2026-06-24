@@ -44,6 +44,7 @@ def lc_ins_dvl_real(
         correct_attitude: bool = False,
         imu_agg_features: bool = False,
         imu_agg_set: str = 'full',
+        dnn_apply_timing: str = 'epoch',
 ) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
@@ -241,6 +242,12 @@ def lc_ins_dvl_real(
     agg_sum_f = np.zeros(3); agg_sumsq_f = np.zeros(3)
     agg_n = 0
 
+    # 'midway' timing: the DNN velocity correction (computed at the DVL epoch) is
+    # held and applied at the interval midpoint (t_k + interval/2) instead of at
+    # the epoch. pending_corr holds the model output; corr_apply_time the target time.
+    pending_corr = None
+    corr_apply_time = None
+
     # Progress bar
     print('Processing: ', end='', flush=True)
     progress_mark = 0
@@ -296,6 +303,17 @@ def lc_ins_dvl_real(
             tor_i, old_est_L_b, old_est_lambda_b, old_est_h_b, old_est_v_eb_n, old_est_C_b_n,
             meas_f_ib_b, meas_omega_ib_b
         )
+
+        # 'midway' timing: apply the deferred DNN velocity-only update once the
+        # interval midpoint is reached (uses the propagated midpoint P).
+        if pending_corr is not None and time >= corr_apply_time:
+            H_dnn = np.zeros((3, 15))
+            H_dnn[0:3, 3:6] = np.eye(3)
+            dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+            R_dnn = np.eye(3) * dnn_sd ** 2
+            P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
+            est_v_eb_n = est_v_eb_n - (K_dnn @ (-pending_corr))[3:6]
+            pending_corr = None
 
         # Determine whether to update DVL update and run Kalman filter
         if (time - time_last_dvl) >= dvl_config['epoch_interval']:
@@ -434,14 +452,19 @@ def lc_ins_dvl_real(
                                                     imu_agg=imu_agg)
                     if correction is not None:
                         vel_corr = correction[0:3]   # multi-task: ignore attitude output
-                        H_dnn = np.zeros((3, 15))
-                        H_dnn[0:3, 3:6] = np.eye(3)
-                        dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
-                        R_dnn = np.eye(3) * dnn_sd ** 2
-                        P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
-                        # Sign convention matches DVL: delta_z = v_nom - z_meas = -correction
-                        x_dnn = K_dnn @ (-vel_corr)
-                        est_v_eb_n = est_v_eb_n - x_dnn[3:6]
+                        if dnn_apply_timing == 'midway':
+                            # Defer the velocity-only update to the interval midpoint.
+                            pending_corr = vel_corr
+                            corr_apply_time = time + dvl_config['epoch_interval'] / 2.0
+                        else:
+                            H_dnn = np.zeros((3, 15))
+                            H_dnn[0:3, 3:6] = np.eye(3)
+                            dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+                            R_dnn = np.eye(3) * dnn_sd ** 2
+                            P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
+                            # Sign convention matches DVL: delta_z = v_nom - z_meas = -correction
+                            x_dnn = K_dnn @ (-vel_corr)
+                            est_v_eb_n = est_v_eb_n - x_dnn[3:6]
 
             # Generate KF uncertainty output record
             out_kf_sd[epoch, 0] = time

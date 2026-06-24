@@ -50,6 +50,7 @@ def lc_ins_dvl_sim(
         correct_attitude: bool = False,
         imu_agg_features: bool = False,
         imu_agg_set: str = 'full',
+        dnn_apply_timing: str = 'epoch',
 ) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
@@ -210,6 +211,10 @@ def lc_ins_dvl_sim(
     agg_sum_f = np.zeros(3); agg_sumsq_f = np.zeros(3)
     agg_n = 0
 
+    # 'midway' timing: defer the DNN velocity correction to the interval midpoint.
+    pending_corr = None
+    corr_apply_time = None
+
     # Progress bar
     print('Processing: ', end='', flush=True)
     progress_mark = 0
@@ -270,6 +275,11 @@ def lc_ins_dvl_sim(
             tor_i, old_est_L_b, old_est_lambda_b, old_est_h_b, old_est_v_eb_n, old_est_C_b_to_n,
             meas_f_ib_b, meas_omega_ib_b
         )
+
+        # 'midway' timing: apply the deferred DNN velocity correction at the midpoint.
+        if pending_corr is not None and time >= corr_apply_time:
+            est_v_eb_n = est_v_eb_n + pending_corr
+            pending_corr = None
 
         # Determine whether to update DVL update and run Kalman filter
         if (time - time_last_dvl) >= dvl_config['epoch_interval']:
@@ -375,13 +385,17 @@ def lc_ins_dvl_sim(
                                                     imu_agg=imu_agg)
                     if correction is not None:
                         correction = correction[0:3]   # multi-task: ignore attitude output
-                        est_v_eb_n = est_v_eb_n + correction
+                        if dnn_apply_timing == 'midway':
+                            pending_corr = correction
+                            corr_apply_time = time + dvl_config['epoch_interval'] / 2.0
+                        else:
+                            est_v_eb_n = est_v_eb_n + correction
 
                         # --- Optionally update P after DNN correction ---
                         # Treats the DNN correction as a virtual NED-velocity measurement.
                         # H selects velocity states (indices 3:6) directly in NED frame.
                         # Toggle via update_P_after_dnn=True / False (default False = no change).
-                        if update_P_after_dnn:
+                        if dnn_apply_timing != 'midway' and update_P_after_dnn:
                             H_dnn = np.zeros((3, 15))
                             H_dnn[0:3, 3:6] = np.eye(3)
                             dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])

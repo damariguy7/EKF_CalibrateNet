@@ -78,6 +78,8 @@ def _dnn_config_token(dnn_config, dnn_vel_sd=None):
         parts.append(f"m{mode}")
     if dnn_config.get('dnn_correct_attitude', False):
         parts.append("att")   # Option B: 6-dim output (velocity + attitude error)
+    if dnn_config.get('dnn_apply_timing', 'epoch') != 'epoch':
+        parts.append("tmidway")   # correction applied at the inter-DVL midpoint (plot only)
     # Loss token: omit for plain 'mse' (backwards-compatible); 'filter' = filter-aware loss.
     if dnn_config.get('loss_mode', 'mse') != 'mse':
         parts.append(f"l{dnn_config.get('loss_mode')}")
@@ -623,7 +625,8 @@ def main(config):
                     update_P_after_dnn=True,
                     dnn_mode=mode,
                     imu_agg_features=cfg_for_mode.get('imu_agg_features', False),
-                    imu_agg_set=cfg_for_mode.get('imu_agg_set', 'full'))
+                    imu_agg_set=cfg_for_mode.get('imu_agg_set', 'full'),
+                    dnn_apply_timing=cfg_for_mode.get('dnn_apply_timing', 'epoch'))
 
                 prmse_by_mode[mode].append(float(np.sqrt(np.mean(
                     out_err_dnn[:, 1]**2 + out_err_dnn[:, 2]**2 + out_err_dnn[:, 3]**2))))
@@ -777,7 +780,7 @@ if __name__ == '__main__':
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory10', 'trajectory12'],
+        'real_test_files': ['trajectory1', 'trajectory2'],
 
         # Cut the last N seconds off each test trajectory, by position:
         # [0] → first test trajectory, [1] → second, etc. 0 (or a missing entry)
@@ -787,7 +790,7 @@ if __name__ == '__main__':
         'split_seed': 42,                   # RNG seed for reproducible auto-splits
 
         # Mode flags
-        'train_data': True,                 # train DNN on the train split
+        'train_data': True,                # train DNN on the train split
         'test_data':  True,                 # run EKF baseline + DNN on the test split
         'sim_test_first_only': True,        # sim only: limit test loop to test_files[:1]
         'run_nadav': False,                 # real only: also run+save the Nadav EKF baseline
@@ -803,7 +806,7 @@ if __name__ == '__main__':
             'epochs':      100,
             'lr':          1e-3,
             'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
-            'tag':         'traj_10_12',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'tag':         'traj_1_2',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
@@ -844,6 +847,11 @@ if __name__ == '__main__':
             # Which aggregates: 'full' = [Δθ,Δv,std(ω),std(f)] (12-dim, fv3);
             # 'dtheta' = just Δθ (3-dim, fv3dtheta) — the lean ablation.
             'imu_agg_set': 'dtheta',
+            # Sequential DNN-correction application timing (inference-only, reuses
+            # the same weights): 'epoch' = at the DVL update (current);
+            # 'midway' = at the inter-DVL interval midpoint (t_k + interval/2).
+            # Plot-folder token 'tmidway'; checkpoint name unchanged.
+            'dnn_apply_timing': 'midway',
         },
     }
 
