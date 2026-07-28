@@ -162,10 +162,10 @@ def P_predict(
 
     # Position error propagation
 
-    # F_32 * tor_s
+    # F_32 * tor_s  (position state in radians: δL̇=vN/(RN+h), δλ̇=vE/((RE+h)*cosL), δḣ=-vD)
     Phi_matrix[6:9, 3:6] = np.array([
-        [1, 0, 0],
-        [0, 1, 0],
+        [1 / (R_N + est_h_b_old), 0, 0],
+        [0, 1 / ((R_E + est_h_b_old) * np.cos(est_L_b_old)), 0],
         [0, 0, -1]
     ]) * tor_s
 

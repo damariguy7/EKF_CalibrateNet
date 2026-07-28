@@ -106,7 +106,7 @@ def lc_ins_dvl_sim(
     true_v_eb_n = in_gt_profile[0, 4:7].copy()
 
     # Initialize Kalman filter P matrix and IMU bias states
-    P_matrix = initialize_lc_p_matrix(lc_kf_config)
+    P_matrix = initialize_lc_p_matrix(lc_kf_config, lat=true_L_b, h=true_h_b)
     est_imu_bias = np.zeros(6)
 
     # Generate KF uncertainty record

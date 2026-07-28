@@ -206,11 +206,16 @@ def _real_split(real_files, real_test_files, seed):
     return _split_files(real_files, seed)
 
 
-def _load_scenario(data_dir, name, trim_start, scale_imu):
-    """Load GT/IMU/DVL CSVs for one scenario. Optionally trim leading seconds and rescale IMU."""
+def _load_scenario(data_dir, name, trim_start, scale_imu, use_noised_dvl=False):
+    """Load GT/IMU/DVL CSVs for one scenario. Optionally trim leading seconds and rescale IMU.
+
+    use_noised_dvl=True loads DVL_<name>_noised.csv (produced by noise_dvl.py)
+    instead of DVL_<name>.csv, so the EKF runs on the perturbed DVL recordings.
+    """
+    dvl_name = f'DVL_{name}_noised.csv' if use_noised_dvl else f'DVL_{name}.csv'
     gt  = np.array(pd.read_csv(os.path.join(data_dir, f'GT_{name}.csv'),  header=0).iloc[:, 0:10])
     imu = np.array(pd.read_csv(os.path.join(data_dir, f'IMU_{name}.csv'), header=0).iloc[:, 0:7])
-    dvl = np.array(pd.read_csv(os.path.join(data_dir, f'DVL_{name}.csv'), header=0).iloc[:, 0:4])
+    dvl = np.array(pd.read_csv(os.path.join(data_dir, dvl_name), header=0).iloc[:, 0:4])
     if scale_imu:
         # Real-data only: IMU recorded at 1/100 of physical units; restore.
         imu[:, 1:7] *= 100
@@ -301,7 +306,7 @@ def _precompute_filter_targets(aux, vel_meas_SD, dnn_vel_SD, dnn_mode='joint'):
 
 def _collect_scenario_data(name, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
                            dnn_mode='sequential', capture_aux=False, correct_attitude=False,
-                           imu_agg_features=False, imu_agg_set='full'):
+                           imu_agg_features=False, imu_agg_set='full', use_noised_dvl=False):
     """Run one scenario through the EKF in collect mode, return (features, labels).
 
     `dnn_mode` selects the label expression: 'sequential' yields the post-DVL
@@ -314,7 +319,7 @@ def _collect_scenario_data(name, data_dir, trim_start, scale_imu, ekf_fn, dvl_cf
     label → 6-dim labels. `imu_agg_features=True` (fv3) appends 12-dim inter-epoch
     high-rate IMU aggregates to the feature → 27-dim features.
     """
-    gt, imu, dvl = _load_scenario(data_dir, name, trim_start, scale_imu)
+    gt, imu, dvl = _load_scenario(data_dir, name, trim_start, scale_imu, use_noised_dvl)
     if capture_aux:
         _, _, _, _, features, labels, aux = ekf_fn(
             imu, dvl, gt, imu.shape[0], dvl_cfg, kf_cfg,
@@ -383,6 +388,23 @@ def _write_config_txt(plots_dir, scenario_name, config, data_dir,
         f.write('\n'.join(lines) + '\n')
 
 
+def _training_curve_lines(history):
+    """Return a per-epoch train/val loss table (list of str) for config.txt.
+
+    Losses are on the normalised scale used during training (≈1.0 means the
+    model is no better than predicting the label mean).
+    """
+    lines = [
+        "",
+        "── TRAINING CURVE (per epoch) ──────────────",
+        "  epoch    train_loss     val_loss",
+    ]
+    for e, tr, va in zip(history['epoch'], history['train_loss'], history['val_loss']):
+        va_str = '        N/A' if va is None else f"{va:12.6f}"
+        lines.append(f"  {e:5d}  {tr:12.6f}  {va_str}")
+    return lines
+
+
 def _save_training_results(history, out_dir):
     """Persist the per-epoch train/val loss curves to <out_dir>.
 
@@ -433,6 +455,8 @@ def main(config):
     trim_start  = config.get('trim_start_seconds', 0) if data_type == 'sim' else 0
     output_dir  = config['output_dir']
     seed        = config.get('split_seed', 42)
+    # Load DVL_<name>_noised.csv (from noise_dvl.py) instead of DVL_<name>.csv.
+    use_noised_dvl = config.get('use_noised_dvl', False)
 
     # One timestamp per run, appended to every results folder so repeated runs
     # with the same config don't overwrite each other (format: YYYYMMDD_HHMMSS).
@@ -482,13 +506,15 @@ def main(config):
                     f, l, aux = _collect_scenario_data(
                         sc, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
                         dnn_mode=dnn_mode, capture_aux=True, correct_attitude=correct_attitude,
-                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set)
+                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set,
+                        use_noised_dvl=use_noised_dvl)
                     auxes.append(aux)
                 else:
                     f, l = _collect_scenario_data(
                         sc, data_dir, trim_start, scale_imu, ekf_fn, dvl_cfg, kf_cfg,
                         dnn_mode=dnn_mode, correct_attitude=correct_attitude,
-                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set)
+                        imu_agg_features=imu_agg_features, imu_agg_set=imu_agg_set,
+                        use_noised_dvl=use_noised_dvl)
                 feats.append(f); lbls.append(l)
             features = np.concatenate(feats, axis=0)
             labels   = np.concatenate(lbls,  axis=0)
@@ -534,7 +560,8 @@ def main(config):
                                        f"mode     : {dnn_mode}",
                                        f"final train_loss : {history['train_loss'][-1]:.6f}",
                                        f"final val_loss   : "
-                                       f"{history['val_loss'][-1] if history['val_loss'][-1] is not None else 'N/A'}"])
+                                       f"{history['val_loss'][-1] if history['val_loss'][-1] is not None else 'N/A'}"]
+                                      + _training_curve_lines(history))
 
     # =========================================================================
     # TEST DNN VELOCITY COMPENSATOR (sim or real, dispatched via data_type)
@@ -591,7 +618,7 @@ def main(config):
             trim_end = test_trim_end[i_sc] if i_sc < len(test_trim_end) else 0
             print(f'Testing {data_type} scenario: {sc}'
                   + (f' (trim last {trim_end}s)' if trim_end else ''))
-            gt_t, imu_t, dvl_t = _load_scenario(data_dir, sc, trim_start, scale_imu)
+            gt_t, imu_t, dvl_t = _load_scenario(data_dir, sc, trim_start, scale_imu, use_noised_dvl)
             gt_t, imu_t, dvl_t = _trim_end_seconds(gt_t, imu_t, dvl_t, trim_end)
             ne = imu_t.shape[0]
 
@@ -780,7 +807,7 @@ if __name__ == '__main__':
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory1', 'trajectory2'],
+        'real_test_files': ['trajectory10', 'trajectory11', 'trajectory12'],
 
         # Cut the last N seconds off each test trajectory, by position:
         # [0] → first test trajectory, [1] → second, etc. 0 (or a missing entry)
@@ -790,10 +817,15 @@ if __name__ == '__main__':
         'split_seed': 42,                   # RNG seed for reproducible auto-splits
 
         # Mode flags
-        'train_data': True,                # train DNN on the train split
+        'train_data': False,                # train DNN on the train split
         'test_data':  True,                 # run EKF baseline + DNN on the test split
         'sim_test_first_only': True,        # sim only: limit test loop to test_files[:1]
-        'run_nadav': False,                 # real only: also run+save the Nadav EKF baseline
+        'run_nadav': False,                  # real only: also run+save the Nadav EKF baseline
+
+        # Load DVL_<name>_noised.csv (generated by noise_dvl.py) instead of the
+        # raw DVL_<name>.csv, for both training and test. Requires the _noised
+        # files to exist in the data dir (currently only real_data/).
+        'use_noised_dvl': False,
 
         'trim_start_seconds': 50,           # sim only
 
@@ -806,7 +838,7 @@ if __name__ == '__main__':
             'epochs':      100,
             'lr':          1e-3,
             'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
-            'tag':         'traj_1_2',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'tag':         'traj_10_11_12',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
@@ -851,7 +883,7 @@ if __name__ == '__main__':
             # the same weights): 'epoch' = at the DVL update (current);
             # 'midway' = at the inter-DVL interval midpoint (t_k + interval/2).
             # Plot-folder token 'tmidway'; checkpoint name unchanged.
-            'dnn_apply_timing': 'midway',
+            'dnn_apply_timing': 'epoch',
         },
     }
 
@@ -868,18 +900,33 @@ if __name__ == '__main__':
 
         # Colleague conventional EKF: P0 = [0.2 m/s, 5 deg, 30 mg, 30 deg/h]
         'init_att_unc': np.deg2rad(2.0), # deg
-        'init_vel_unc': 0.2, #m/s
-        'init_pos_unc': 5.0, # m
+        'init_vel_unc': 0.1, #m/s
+        'init_pos_unc': 0.5, # m
         'init_b_a_unc': 1.0e-4, #micro-g
         'init_b_g_unc': np.deg2rad(30.0) / 3600, # deg/h
 
-        'gyro_noise_PSD':  1.0e-5, # (rad/s)^2/HZ
-        'accel_noise_PSD': 1.0e-2, # (m/s)^2/HZ
+        'gyro_noise_PSD':  1.0e-10, # (rad/s)^2/HZ  — matched to colleague (sigma_gyro=1e-4)
+        'accel_noise_PSD': 9.0e-3, # (m/s^2)^2/HZ — matched to colleague (sigma_acc=3e-2)
 
-        'accel_bias_PSD': 1.0e-3,
-        'gyro_bias_PSD':  1.0e-6,
+        'accel_bias_PSD': 9e-5,  # matched to colleague (sigma_ba=3e-4)
+        'gyro_bias_PSD':  1e-14, # matched to colleague (sigma_bg=1e-6)
 
-        'vel_meas_SD': 0.5, #m/s
+        # 'init_att_unc': np.deg2rad(2.0), # deg
+        # 'init_vel_unc': 0.1, #m/s
+        # 'init_pos_unc': 0.5, # m
+        # 'init_b_a_unc': 1.0e-4, #micro-g
+        # 'init_b_g_unc': np.deg2rad(30.0) / 3600, # deg/h
+        #
+        # 'gyro_noise_PSD':  1.0e-10, # (rad/s)^2/HZ  — matched to colleague (sigma_gyro=1e-4)
+        # 'accel_noise_PSD': 9.0e-3, # (m/s^2)^2/HZ — matched to colleague (sigma_acc=3e-2)
+        #
+        # 'accel_bias_PSD': 9e-2,  # matched to colleague (sigma_ba=3e-4)
+        # 'gyro_bias_PSD':  1e-10, # matched to colleague (sigma_bg=1e-6)
+
+        # 'accel_bias_PSD': 9.0e-8,  # matched to colleague (sigma_ba=3e-4)
+        # 'gyro_bias_PSD': 1.0e-12,  # matched to colleague (sigma_bg=1e-6)
+
+        'vel_meas_SD': 0.02, #m/s
         # dnn_vel_SD raised from 0.5 to down-weight the DNN in joint mode: at 0.5
         # the DNN had equal trust to the DVL, and since the DNN measurement is
         # correlated with the DVL (it takes dvl_v + innovation as inputs) the
@@ -891,7 +938,7 @@ if __name__ == '__main__':
         # NOTE: filter-loss models BAKE this SD (checkpoint name carries sd<value>),
         # so changing it requires retraining (cheap — no re-collection). 1.5 diverged
         # at inference (SVD); 2.5 is a stable starting point, sweep down toward 2.0.
-        'dnn_vel_SD':  2.5,
+        'dnn_vel_SD':  0.5,
         # Adaptive DNN gate (inference-only, no retraining): scale the correction by
         # g = m^2/(m^2+tau^2), m=||innovation||. Suppresses the DNN where EKF<->DVL
         # agree (accurate trajectories). Measured mean ||innov||: traj4~0.097 (help),

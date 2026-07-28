@@ -27,6 +27,7 @@ from kinematics_ned import kinematics_ned
 from nav_equations_ned import nav_equations_ned
 from body_to_ned import body_to_ned
 from P_predict import P_predict
+from radii_of_curvature import radii_of_curvature
 
 
 def lc_ins_dvl_real(
@@ -185,7 +186,7 @@ def lc_ins_dvl_real(
     out_errors[0, 7:10] = delta_eul_nb_n
 
     # Initialize Kalman filter P matrix and IMU bias states
-    P_matrix = initialize_lc_p_matrix(lc_kf_config)
+    P_matrix = initialize_lc_p_matrix(lc_kf_config, lat=old_est_L_b, h=old_est_h_b)
     est_imu_bias = np.zeros(6)
 
     # # Initialize IMU quantization residuals
@@ -209,6 +210,9 @@ def lc_ins_dvl_real(
     out_kf_sd[0, 0] = old_time
     for i in range(15):
         out_kf_sd[0, i + 1] = np.sqrt(P_matrix[i, i])
+    _R_N0, _R_E0 = radii_of_curvature(old_est_L_b)
+    out_kf_sd[0, 7] = np.sqrt(P_matrix[6, 6]) * _R_N0
+    out_kf_sd[0, 8] = np.sqrt(P_matrix[7, 7]) * (_R_E0 + old_est_h_b) * np.cos(old_est_L_b)
 
     # Initialize DVL model timing
     time_last_dvl = old_time
@@ -296,7 +300,9 @@ def lc_ins_dvl_real(
         out_kf_sd[epoch, 0] = time
         for i in range(15):
             out_kf_sd[epoch, i + 1] = np.sqrt(P_matrix[i, i])
-
+        _R_N, _R_E = radii_of_curvature(old_est_L_b)
+        out_kf_sd[epoch, 7] = np.sqrt(P_matrix[6, 6]) * _R_N
+        out_kf_sd[epoch, 8] = np.sqrt(P_matrix[7, 7]) * (_R_E + old_est_h_b) * np.cos(old_est_L_b)
 
         # Update estimated navigation solution
         est_L_b, est_lambda_b, est_h_b, est_v_eb_n, est_C_b_n = nav_equations_ned(
@@ -470,6 +476,9 @@ def lc_ins_dvl_real(
             out_kf_sd[epoch, 0] = time
             for i in range(15):
                 out_kf_sd[epoch, i + 1] = np.sqrt(P_matrix[i, i])
+            _R_N, _R_E = radii_of_curvature(est_L_b)
+            out_kf_sd[epoch, 7] = np.sqrt(P_matrix[6, 6]) * _R_N
+            out_kf_sd[epoch, 8] = np.sqrt(P_matrix[7, 7]) * (_R_E + est_h_b) * np.cos(est_L_b)
 
 
         # Generate IMU bias output record (every IMU epoch)

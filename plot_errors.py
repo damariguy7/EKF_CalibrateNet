@@ -3,6 +3,33 @@ import matplotlib.pyplot as plt
 import navpy
 
 
+def _sigma_pct(error, time_e, std, time_s):
+    """Return % of |error| samples within the ±1σ bound (std interpolated onto time_e)."""
+    std_i = np.interp(time_e, time_s, std)
+    return 100.0 * np.mean(np.abs(error) <= std_i)
+
+
+def _improvement_pct(base, dnn):
+    """% error reduction of the DNN over the baseline (positive = DNN is better).
+
+    improvement % = 100 * (baseline - dnn) / baseline; returns None if baseline≈0.
+    """
+    if base is None or dnn is None or abs(base) < 1e-12:
+        return None
+    return 100.0 * (base - dnn) / base
+
+
+def _annotate_improvement(ax, bar, base_val):
+    """Label a DNN bar with its % improvement vs baseline (green ↑good / red ↓worse)."""
+    imp = _improvement_pct(base_val, bar.get_height())
+    if imp is None:
+        return
+    color = 'green' if imp >= 0 else 'firebrick'
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.06,
+            f'{imp:+.1f}%', ha='center', va='bottom',
+            fontsize=7, fontweight='bold', color=color)
+
+
 def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
     """
     Plot navigation errors with ±1-sigma standard deviation bounds.
@@ -57,9 +84,10 @@ def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
         ax.fill_between(time_kf, -pos_std[:, i], pos_std[:, i],
                         color=color, alpha=0.2, label='±1σ bounds')
 
+        pct = _sigma_pct(pos_errors[:, i], time_errors, pos_std[:, i], time_kf)
         ax.set_ylabel(f'{label} Position Error (m)', fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
-        ax.set_title(f'{label} Position Error', fontsize=11)
+        ax.set_title(f'{label} Position Error  [{pct:.1f}% within ±1σ]', fontsize=11)
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -88,9 +116,10 @@ def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
         ax.fill_between(time_kf, -vel_std[:, i], vel_std[:, i],
                         color=color, alpha=0.2, label='±1σ bounds')
 
+        pct = _sigma_pct(vel_errors[:, i], time_errors, vel_std[:, i], time_kf)
         ax.set_ylabel(f'{label} Velocity Error (m/s)', fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
-        ax.set_title(f'{label} Velocity Error', fontsize=11)
+        ax.set_title(f'{label} Velocity Error  [{pct:.1f}% within ±1σ]', fontsize=11)
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -119,9 +148,10 @@ def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
         ax.fill_between(time_kf, -att_std[:, i], att_std[:, i],
                         color=color, alpha=0.2, label='±1σ bounds')
 
+        pct = _sigma_pct(att_errors[:, i], time_errors, att_std[:, i], time_kf)
         ax.set_ylabel(f'{label} Error (deg)', fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
-        ax.set_title(f'{label} Attitude Error', fontsize=11)
+        ax.set_title(f'{label} Attitude Error  [{pct:.1f}% within ±1σ]', fontsize=11)
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -160,9 +190,10 @@ def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
         ax.fill_between(time_kf, -bias_a_std_ug[:, i], bias_a_std_ug[:, i],
                         color=color, alpha=0.2, label='±1σ bounds')
 
+        pct = _sigma_pct(bias_a_est_ug[:, i], time_bias, bias_a_std_ug[:, i], time_kf)
         ax.set_ylabel(f'{label} Accel Bias (μg)', fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
-        ax.set_title(f'{label} Accelerometer Bias Estimate', fontsize=11)
+        ax.set_title(f'{label} Accelerometer Bias Estimate  [{pct:.1f}% within ±1σ]', fontsize=11)
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -200,9 +231,10 @@ def plot_errors_with_std(out_errors, out_KF_SD, out_IMU_bias_est):
         ax.fill_between(time_kf, -bias_g_std_dph[:, i], bias_g_std_dph[:, i],
                         color=color, alpha=0.2, label='±1σ bounds')
 
+        pct = _sigma_pct(bias_g_est_dph[:, i], time_bias, bias_g_std_dph[:, i], time_kf)
         ax.set_ylabel(f'{label} Gyro Bias (deg/h)', fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
-        ax.set_title(f'{label} Gyro Bias Estimate', fontsize=11)
+        ax.set_title(f'{label} Gyro Bias Estimate  [{pct:.1f}% within ±1σ]', fontsize=11)
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -328,7 +360,9 @@ def plot_errors_comparison(out_errors_base, out_sd_base,
         for label, errs, sds, color, ls in runs:
             t_e = errs[:, 0]
             t_s = sds[:, 0]
-            ax.plot(t_e, errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            pct = _sigma_pct(errs[:, 1 + i], t_e, sds[:, 7 + i], t_s)
+            ax.plot(t_e, errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls,
+                    label=f'{label} ({pct:.0f}%)')
             ax.fill_between(t_s, -sds[:, 7 + i], sds[:, 7 + i], color=color, alpha=0.12)
         ax.set_ylabel(pos_labels[i], fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
@@ -344,7 +378,9 @@ def plot_errors_comparison(out_errors_base, out_sd_base,
         for label, errs, sds, color, ls in runs:
             t_e = errs[:, 0]
             t_s = sds[:, 0]
-            ax.plot(t_e, errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            pct = _sigma_pct(errs[:, 4 + i], t_e, sds[:, 4 + i], t_s)
+            ax.plot(t_e, errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls,
+                    label=f'{label} ({pct:.0f}%)')
             ax.fill_between(t_s, -sds[:, 4 + i], sds[:, 4 + i], color=color, alpha=0.12)
         ax.set_ylabel(vel_labels[i], fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
@@ -360,7 +396,9 @@ def plot_errors_comparison(out_errors_base, out_sd_base,
         for label, errs, sds, color, ls in runs:
             t_e = errs[:, 0]
             t_s = sds[:, 0]
-            ax.plot(t_e, np.rad2deg(errs[:, 7 + i]), color=color, linewidth=1.5, linestyle=ls, label=label)
+            pct = _sigma_pct(np.rad2deg(errs[:, 7 + i]), t_e, np.rad2deg(sds[:, 1 + i]), t_s)
+            ax.plot(t_e, np.rad2deg(errs[:, 7 + i]), color=color, linewidth=1.5, linestyle=ls,
+                    label=f'{label} ({pct:.0f}%)')
             ax.fill_between(t_s, -np.rad2deg(sds[:, 1 + i]), np.rad2deg(sds[:, 1 + i]),
                             color=color, alpha=0.12)
         ax.set_ylabel(att_labels[i], fontsize=10)
@@ -498,7 +536,9 @@ def plot_pos_vel_two_runs(out_err_base, out_sd_base,
     pos_labels = ['North (m)', 'East (m)', 'Down (m)']
     for i, ax in enumerate(axes_pos):
         for label, errs, sds, color, ls in runs:
-            ax.plot(errs[:, 0], errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            pct = _sigma_pct(errs[:, 1 + i], errs[:, 0], sds[:, 7 + i], sds[:, 0])
+            ax.plot(errs[:, 0], errs[:, 1 + i], color=color, linewidth=1.5, linestyle=ls,
+                    label=f'{label} ({pct:.0f}%)')
             ax.fill_between(sds[:, 0], -sds[:, 7 + i], sds[:, 7 + i], color=color, alpha=0.12)
         ax.set_ylabel(pos_labels[i], fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
@@ -512,7 +552,9 @@ def plot_pos_vel_two_runs(out_err_base, out_sd_base,
     vel_labels = ['North (m/s)', 'East (m/s)', 'Down (m/s)']
     for i, ax in enumerate(axes_vel):
         for label, errs, sds, color, ls in runs:
-            ax.plot(errs[:, 0], errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls, label=label)
+            pct = _sigma_pct(errs[:, 4 + i], errs[:, 0], sds[:, 4 + i], sds[:, 0])
+            ax.plot(errs[:, 0], errs[:, 4 + i], color=color, linewidth=1.5, linestyle=ls,
+                    label=f'{label} ({pct:.0f}%)')
             ax.fill_between(sds[:, 0], -sds[:, 4 + i], sds[:, 4 + i], color=color, alpha=0.12)
         ax.set_ylabel(vel_labels[i], fontsize=10)
         ax.set_xlabel('Time (s)', fontsize=10)
@@ -557,8 +599,10 @@ def plot_att_bias_two_runs(out_err_base, out_sd_base, out_bias_base,
     att_labels = ['Roll (deg)', 'Pitch (deg)', 'Yaw (deg)']
     for i, ax in enumerate(axes_att):
         for label, errs, sds, _, color, ls in runs:
+            pct = _sigma_pct(np.rad2deg(errs[:, 7 + i]), errs[:, 0],
+                             np.rad2deg(sds[:, 1 + i]), sds[:, 0])
             ax.plot(errs[:, 0], np.rad2deg(errs[:, 7 + i]),
-                    color=color, linewidth=1.5, linestyle=ls, label=label)
+                    color=color, linewidth=1.5, linestyle=ls, label=f'{label} ({pct:.0f}%)')
             ax.fill_between(sds[:, 0],
                             -np.rad2deg(sds[:, 1 + i]), np.rad2deg(sds[:, 1 + i]),
                             color=color, alpha=0.12)
@@ -752,10 +796,16 @@ def plot_prmse_vrmse_per_trajectory(scenario_names, prmse_base, vrmse_base,
             bars_p = ax.bar(x + offsets[2], dnn_p_vals, width,
                             color='crimson',   label=f'DNN ({arch}, P-update)')
             _add_labels(ax, bars_p)
+            for bar, b in zip(bars_np, base_vals):
+                _annotate_improvement(ax, bar, b)
+            for bar, b in zip(bars_p, base_vals):
+                _annotate_improvement(ax, bar, b)
         else:
             bars_p = ax.bar(x + offsets[1], dnn_p_vals, width,
                             color='crimson',   label=f'DNN ({arch}, P-update)')
             _add_labels(ax, bars_p)
+            for bar, b in zip(bars_p, base_vals):
+                _annotate_improvement(ax, bar, b)
         ax.set_xticks(x)
         ax.set_xticklabels(short_names, rotation=30, ha='right', fontsize=9)
         ax.set_ylabel(ylabel, fontsize=11)
@@ -819,6 +869,8 @@ def plot_prmse_vrmse_per_axis(out_err_base, out_err_dnn, scenario='', arch='lstm
         bars_dnn = ax.bar(x + width / 2, dnn_vals, width,
                           color='crimson', label=f'DNN ({arch}, P-update)')
         _add_labels(ax, bars_dnn)
+        for bar, b in zip(bars_dnn, base_vals):
+            _annotate_improvement(ax, bar, b)
         ax.set_xticks(x)
         ax.set_xticklabels(axes_labels, fontsize=10)
         ax.set_ylabel(ylabel, fontsize=11)
