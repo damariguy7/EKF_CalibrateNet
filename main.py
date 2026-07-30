@@ -13,9 +13,11 @@ from lc_ins_dvl_real import lc_ins_dvl_real
 from lc_ins_dvl_real_nadav import lc_ins_dvl_real_nadav
 from lc_ins_dvl_sim import lc_ins_dvl_sim
 from lc_ins_dvl_sim_nadav import lc_ins_dvl_sim_nadav
-from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d, plot_trajectory_2d_comparison, plot_errors_comparison, plot_rmse_over_time, plot_pos_vel_two_runs, plot_att_bias_two_runs, plot_trajectory_two_runs, plot_prmse_vrmse_per_trajectory, plot_prmse_vrmse_per_axis
+from plot_errors import plot_errors_with_std, plot_results, plot_trajectory_2d, plot_trajectory_2d_comparison, plot_errors_comparison, plot_rmse_over_time, plot_pos_vel_two_runs, plot_att_bias_two_runs, plot_trajectory_two_runs, plot_prmse_vrmse_per_trajectory, plot_prmse_vrmse_per_axis, plot_dnn_sd_over_time
 from dnn_vel_compensator import (train_vel_compensator, save_compensator,
-                                  load_compensator)
+                                  load_compensator, train_uncertainty,
+                                  save_uncertainty, load_uncertainty,
+                                  _UNC_DEFAULT_GROUPS)
 from skew_symmetric import skew_symmetric
 
 
@@ -147,6 +149,43 @@ def _build_model_filename(data_type, dnn_config, sim_trajectory_name, dnn_vel_sd
     return '_'.join(parts) + '.pth'
 
 
+def _build_unc_config(dnn_config):
+    """Phase-2 sigma-net config from dnn_config's unc_* overrides.
+
+    Hyper-params default to the phase-1 values; input-design knobs
+    (feature_groups / add_magnitudes / corr_skip) default per the plan.
+    """
+    return {
+        'arch':           dnn_config.get('unc_arch', dnn_config.get('arch', 'tcn')),
+        'hidden_size':    dnn_config.get('unc_hidden_size', dnn_config.get('hidden_size', 64)),
+        'num_layers':     dnn_config.get('num_layers', 2),
+        'window_size':    dnn_config.get('window_size', 10),
+        'batch_size':     dnn_config.get('batch_size', 32),
+        'epochs':         dnn_config.get('unc_epochs', dnn_config.get('epochs', 100)),
+        'lr':             dnn_config.get('unc_lr', dnn_config.get('lr', 1e-3)),
+        'seed':           dnn_config.get('seed', 42),
+        'feature_groups': dnn_config.get('unc_feature_groups', list(_UNC_DEFAULT_GROUPS)),
+        'add_magnitudes': dnn_config.get('unc_add_magnitudes', True),
+        'corr_skip':      dnn_config.get('unc_corr_skip', False),
+        # Early stopping: sigma-net overfits sooner, so a tighter patience by default.
+        'early_stopping': dnn_config.get('early_stopping', True),
+        'es_patience':    dnn_config.get('unc_es_patience', dnn_config.get('es_patience', 15)),
+        'es_min_delta':   dnn_config.get('es_min_delta', 0.0),
+        'es_min_epochs':  dnn_config.get('unc_es_min_epochs', dnn_config.get('es_min_epochs', 0)),
+        'weight_decay':   dnn_config.get('unc_weight_decay', dnn_config.get('weight_decay', 0.0)),
+        'lr_scheduler':   dnn_config.get('unc_lr_scheduler', dnn_config.get('lr_scheduler', 'none')),
+        # Phase-2 target: 'sigma' (learned dnn_vel_SD) or 'fuse_gate' (learned α).
+        'target':         dnn_config.get('unc_target', 'sigma'),
+        'fuse_gate_max':  dnn_config.get('fuse_gate_max', 0.5),
+    }
+
+
+def _uncsd_path(model_path):
+    """Sibling checkpoint path for the phase-2 sigma-net (model + _uncsd suffix)."""
+    return model_path[:-4] + '_uncsd.pth' if model_path.endswith('.pth') \
+        else model_path + '_uncsd.pth'
+
+
 def _discover_sim_scenarios(data_dir, trajectory_name):
     """Glob GT_{trajectory_name}_*.csv in data_dir and return scenario base names."""
     matches = glob.glob(os.path.join(data_dir, f'GT_{trajectory_name}_*.csv'))
@@ -182,13 +221,14 @@ def _split_files(files, seed):
     return train, val, test
 
 
-def _real_split(real_files, real_test_files, seed):
+def _real_split(real_files, real_test_files, seed, val_count=None):
     """Real-data split policy.
 
     If real_test_files is non-empty, treat it as the manual test set and
-    auto-split the remaining (real_files − real_test_files) 80/20 into
-    train/val. Otherwise fall back to the standard 60/20/20 _split_files
-    behaviour on real_files.
+    auto-split the remaining (real_files − real_test_files) into train/val.
+    `val_count` sets the number of validation trajectories exactly (clamped to
+    keep ≥1 train); when None, fall back to an 80/20 split. Otherwise (no manual
+    test set) fall back to the standard 60/20/20 _split_files behaviour.
     """
     if real_test_files:
         test = list(real_test_files)
@@ -198,7 +238,11 @@ def _real_split(real_files, real_test_files, seed):
             return [], [], test
         rng = np.random.default_rng(seed)
         shuffled = rng.permutation(sorted(rest)).tolist()
-        n_train = int(round(len(shuffled) * 0.8))
+        if val_count is not None:
+            n_val   = max(0, min(int(val_count), len(shuffled) - 1))
+            n_train = len(shuffled) - n_val
+        else:
+            n_train = int(round(len(shuffled) * 0.8))
         train = shuffled[:n_train]
         val   = shuffled[n_train:]
         print(f'[split] manual test={len(test)} ({test}); rest {len(rest)} → train={len(train)}, val={len(val)}')
@@ -469,7 +513,8 @@ def main(config):
         train_files, val_files, test_files = _real_split(
             config.get('real_files', []),
             config.get('real_test_files', []),
-            seed)
+            seed,
+            val_count=config.get('real_val_count'))
 
     # =========================================================================
     # TRAIN DNN VELOCITY COMPENSATOR
@@ -563,6 +608,27 @@ def main(config):
                                        f"{history['val_loss'][-1] if history['val_loss'][-1] is not None else 'N/A'}"]
                                       + _training_curve_lines(history))
 
+        # ---- Phase 2: learned per-epoch, per-axis dnn_vel_SD (uncertainty net) ----
+        # Freeze the just-trained velocity model and train a sigma-net that
+        # predicts the per-axis log-variance of its correction (NLL on
+        # r = corr - label). Sequential-only for v1; reuses the phase-1 data.
+        if dnn_config.get('train_dnn_sd', False):
+            if dnn_mode != 'sequential':
+                print(f"[uncertainty] skip: learned dnn_vel_SD is sequential-only "
+                      f"(dnn_mode={dnn_mode}).")
+            else:
+                unc_config = _build_unc_config(dnn_config)
+                print('Training phase-2 uncertainty (sigma) net...')
+                unc_model, unc_norm_stats, unc_history = train_uncertainty(
+                    all_train_features, all_train_labels, unc_config,
+                    model, norm_stats,
+                    val_features=all_val_features, val_labels=all_val_labels)
+                unc_path = _uncsd_path(model_path)
+                save_uncertainty(unc_model, unc_norm_stats, unc_config, unc_path)
+                print(f'Saved uncertainty model to: {unc_path}')
+                _save_training_results(unc_history,
+                                       os.path.join(train_dir, 'uncertainty'))
+
     # =========================================================================
     # TEST DNN VELOCITY COMPENSATOR (sim or real, dispatched via data_type)
     # =========================================================================
@@ -583,11 +649,26 @@ def main(config):
             path  = os.path.join(output_dir, 'trained_model', fname)
             if os.path.exists(path):
                 print(f'Loading {mode} model from: {path}')
+                comp = load_compensator(path)
+                # Attach the sibling phase-2 net (sequential only). It serves either
+                # 'kalman' (learned dnn_vel_SD σ, use_learned_dnn_sd) or 'fuse' (learned
+                # gate α, use_learned_fuse_scale); VelCompensator picks σ vs α from the
+                # saved target. Attach if either consumer is on.
+                if (kf_cfg.get('use_learned_dnn_sd', False)
+                        or kf_cfg.get('use_learned_fuse_scale', False)) and mode == 'sequential':
+                    unc_path = _uncsd_path(path)
+                    if os.path.exists(unc_path):
+                        unc_model, unc_norm_stats = load_uncertainty(unc_path)
+                        comp.attach_uncertainty(unc_model, unc_norm_stats)
+                        print(f'  attached phase-2 net '
+                              f'(target={unc_norm_stats.get("target", "sigma")}): {unc_path}')
+                    else:
+                        print(f'  [phase-2] no net at {unc_path}; falling back to constant')
                 modes_to_test.append({
                     'mode':        mode,
                     'cfg':         cfg_for_mode,
                     'path':        path,
-                    'compensator': load_compensator(path),
+                    'compensator': comp,
                 })
             else:
                 print(f'[skip] {mode} checkpoint not found at: {path}')
@@ -646,6 +727,10 @@ def main(config):
                 cfg_for_mode = entry['cfg']
                 compensator = entry['compensator']
 
+                # Log the applied per-axis dnn_vel_SD (learned sigma) over time so it
+                # can be plotted. Sequential real-data only (lc_ins_dvl_real accepts
+                # the dnn_sigma_log kwarg; lc_ins_dvl_sim does not).
+                dnn_sigma_log = [] if (data_type == 'real' and mode == 'sequential') else None
                 _, out_err_dnn, out_bias_dnn, out_sd_dnn = ekf_fn(
                     imu_t, dvl_t, gt_t, ne, dvl_cfg, kf_cfg,
                     compensator=copy.deepcopy(compensator),
@@ -653,7 +738,8 @@ def main(config):
                     dnn_mode=mode,
                     imu_agg_features=cfg_for_mode.get('imu_agg_features', False),
                     imu_agg_set=cfg_for_mode.get('imu_agg_set', 'full'),
-                    dnn_apply_timing=cfg_for_mode.get('dnn_apply_timing', 'epoch'))
+                    dnn_apply_timing=cfg_for_mode.get('dnn_apply_timing', 'epoch'),
+                    **({'dnn_sigma_log': dnn_sigma_log} if data_type == 'real' else {}))
 
                 prmse_by_mode[mode].append(float(np.sqrt(np.mean(
                     out_err_dnn[:, 1]**2 + out_err_dnn[:, 2]**2 + out_err_dnn[:, 3]**2))))
@@ -729,6 +815,13 @@ def main(config):
                 fig_prmse_axis, fig_vrmse_axis = plot_prmse_vrmse_per_axis(
                     out_err_base, out_err_dnn, scenario=sc, arch=arch)
 
+                # Learned dnn_vel_SD (sigma) over time — sequential real runs only.
+                fig_sd = None
+                if dnn_sigma_log:
+                    fig_sd = plot_dnn_sd_over_time(
+                        dnn_sigma_log, scenario=sc, arch=arch,
+                        const_sd=kf_cfg.get('dnn_vel_SD'))
+
                 fig_pos_sc.savefig(  os.path.join(sc_dir, 'position_errors.png'), dpi=150, bbox_inches='tight')
                 fig_vel_sc.savefig(  os.path.join(sc_dir, 'velocity_errors.png'), dpi=150, bbox_inches='tight')
                 fig_traj_sc.savefig( os.path.join(sc_dir, 'trajectory.png'),      dpi=150, bbox_inches='tight')
@@ -739,6 +832,8 @@ def main(config):
                 fig_vrmse_sc.savefig(os.path.join(sc_dir, 'vrmse.png'),           dpi=150, bbox_inches='tight')
                 fig_prmse_axis.savefig(os.path.join(sc_dir, 'prmse_per_axis.png'), dpi=150, bbox_inches='tight')
                 fig_vrmse_axis.savefig(os.path.join(sc_dir, 'vrmse_per_axis.png'), dpi=150, bbox_inches='tight')
+                if fig_sd is not None:
+                    fig_sd.savefig(os.path.join(sc_dir, 'dnn_sd.png'), dpi=150, bbox_inches='tight')
                 plt.close('all')
                 print(f'  [{mode}] scenario plots saved to {sc_dir}')
 
@@ -807,7 +902,11 @@ if __name__ == '__main__':
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory10', 'trajectory11', 'trajectory12'],
+        'real_test_files': ['trajectory7', 'trajectory9'],
+        # Number of validation trajectories carved from the non-test remainder
+        # (the rest go to train). None → default 80/20 split. Clamped to keep ≥1
+        # train. With 11 non-test files, 3 → train=8/val=3.
+        'real_val_count': 2,
 
         # Cut the last N seconds off each test trajectory, by position:
         # [0] → first test trajectory, [1] → second, etc. 0 (or a missing entry)
@@ -817,7 +916,7 @@ if __name__ == '__main__':
         'split_seed': 42,                   # RNG seed for reproducible auto-splits
 
         # Mode flags
-        'train_data': False,                # train DNN on the train split
+        'train_data': True,                # train DNN on the train split
         'test_data':  True,                 # run EKF baseline + DNN on the test split
         'sim_test_first_only': True,        # sim only: limit test loop to test_files[:1]
         'run_nadav': False,                  # real only: also run+save the Nadav EKF baseline
@@ -836,9 +935,12 @@ if __name__ == '__main__':
             'num_layers':    2,
             'batch_size':   32,
             'epochs':      100,
-            'lr':          1e-3,
+            'lr':          3e-4,           # lowered from 1e-3 (noisy/early-overfit val)
+            # LR schedule for both DNNs: 'cosine' anneals lr base→~0 over 'epochs'
+            # (smoother, lower val minimum); 'none' = constant lr (old behaviour).
+            'lr_scheduler': 'cosine',
             'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
-            'tag':         'traj_10_11_12',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'tag':         'traj_7_9',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
@@ -884,6 +986,39 @@ if __name__ == '__main__':
             # 'midway' = at the inter-DVL interval midpoint (t_k + interval/2).
             # Plot-folder token 'tmidway'; checkpoint name unchanged.
             'dnn_apply_timing': 'epoch',
+            # ---- Phase 2: learn a per-epoch, per-axis dnn_vel_SD (sigma-net) ----
+            # When True, after phase-1 training a second "uncertainty" net is
+            # trained (frozen phase-1 model) that predicts the per-axis log-variance
+            # of the velocity correction; saved next to the model as *_uncsd.pth.
+            # Sequential mode only. To USE it at test, set use_learned_dnn_sd:True in
+            # LC_KF_config_real. Requires train_data:True to (re)generate the file.
+            'train_dnn_sd': True,
+            # Phase-2 target: 'sigma' (learned per-axis dnn_vel_SD, for 'kalman' mode)
+            # or 'fuse_gate' (learned scalar per-epoch fuse scale α for 'fuse' mode,
+            # trained toward α* = clip(corr·label/‖corr‖², 0, fuse_gate_max)).
+            'unc_target': 'fuse_gate',
+            'fuse_gate_max': 0.5,       # upper clamp on the learned α
+            # sigma-net hyper-params default to the phase-1 values above; override
+            # here if desired: 'unc_arch','unc_hidden_size','unc_epochs','unc_lr'.
+            # Input design (ablatable): which groups the sigma-net sees, whether to
+            # append their scalar magnitudes, and the (reserved) corr skip path.
+            'unc_feature_groups': list(_UNC_DEFAULT_GROUPS),   # drops 'euler' by default
+            'unc_add_magnitudes': False,
+            # Early stopping (both DNNs): restore the best-val checkpoint and stop
+            # after es_patience epochs with no val improvement. Applies to phase-1
+            # and phase-2; the sigma-net can use a tighter unc_es_patience. Set
+            # early_stopping:False to train the full 'epochs' (old behaviour).
+            'early_stopping': True,
+            'es_patience':    25,    # more tolerance: wait 25 no-improve epochs
+            'es_min_delta':   0.0,
+            'es_min_epochs':  30,    # never stop before epoch 30 (floor for both nets)
+            'unc_es_patience': 20,   # sigma-net overfits sooner, but give it room too
+            # 'unc_es_min_epochs': 30,  # override the floor for the sigma-net only
+            # Weight decay (L2) slows overfitting so the val minimum lands LATER —
+            # this is what makes 'more tolerance' actually train longer usefully.
+            # 0.0 = off. unc_weight_decay overrides it for the sigma-net.
+            'weight_decay':      1e-3,   # raised from 1e-4 to delay the ~ep15 overfit
+            'unc_weight_decay':  1e-3,
         },
     }
 
@@ -938,7 +1073,7 @@ if __name__ == '__main__':
         # NOTE: filter-loss models BAKE this SD (checkpoint name carries sd<value>),
         # so changing it requires retraining (cheap — no re-collection). 1.5 diverged
         # at inference (SVD); 2.5 is a stable starting point, sweep down toward 2.0.
-        'dnn_vel_SD':  0.5,
+        'dnn_vel_SD':  0.02,
         # Adaptive DNN gate (inference-only, no retraining): scale the correction by
         # g = m^2/(m^2+tau^2), m=||innovation||. Suppresses the DNN where EKF<->DVL
         # agree (accurate trajectories). Measured mean ||innov||: traj4~0.097 (help),
@@ -953,6 +1088,37 @@ if __name__ == '__main__':
         # attitude-error estimate in the joint update. Inference-only for MSE models
         # (not baked) → sweepable test-only. Smaller = trust the DNN heading more.
         'dnn_att_SD': np.deg2rad(180.0),
+        # ---- Learned per-epoch, per-axis dnn_vel_SD (phase-2 sigma-net) ----
+        # When True (and a *_uncsd.pth sibling exists for the sequential model),
+        # the sequential DNN update uses R_dnn = diag((clip(scale*sigma))^2) with a
+        # motion-dependent sigma from the sigma-net, instead of the constant
+        # dnn_vel_SD above. False = current constant-SD behaviour (exact).
+        # Inference-only knob: sweep freely, no retraining. dnn_sd_scale trims/boosts
+        # the learned trust globally; min/max clamp it to a sane band [m/s].
+        'use_learned_dnn_sd': False,
+        'dnn_sd_scale': 1.0,
+        'dnn_sd_min':   0.02,
+        'dnn_sd_max':   0.002,
+        # How the sequential DNN correction is applied:
+        #   'kalman' — DNN runs a Kalman update that ALSO shrinks P (old default);
+        #              dnn_sd/σ set the gain. Risks overconfident P (correlated meas).
+        #   'inject' — DNN correction added straight to the velocity state
+        #              (est_v += corr), full weight; P updated by the DVL only, so the
+        #              DNN never shrinks P. dnn_sd / use_learned_dnn_sd are unused here
+        #              (σ-net only needed if you still want the dnn_sd.png diagnostic).
+        #   'fuse'   — DNN correction folded into the single DVL update: the DVL
+        #              innovation is shifted by dnn_fuse_scale·Cᵀ·corr, then ONE Kalman
+        #              update runs. P shrinks by the DVL only (honest); the DNN reaches
+        #              the state through the DVL gain. dnn_sd/use_learned_dnn_sd unused.
+        'dnn_apply_mode': 'fuse',
+        # α on the DNN's innovation shift in 'fuse' mode. 1.0 = full fold; lower it
+        # (0.5, 0.2) if traj3 destabilises (the DVL velocity gain is high). Used as
+        # the CONSTANT α, and as the fallback during the gate's warm-up.
+        'dnn_fuse_scale': 0.2,
+        # When True (fuse mode) use the learned per-epoch gate α (phase-2 with
+        # unc_target:'fuse_gate') instead of the constant dnn_fuse_scale. Needs the
+        # *_uncsd.pth gate net (train_dnn_sd:True). False → constant α.
+        'use_learned_fuse_scale': False,
     }
 
     # ========================================================================

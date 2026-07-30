@@ -701,6 +701,60 @@ def plot_trajectory_two_runs(in_gt_profile, out_err_base, out_err_dnn_p=None,
     return fig
 
 
+def plot_dnn_sd_over_time(sigma_log, scenario='', arch='lstm', const_sd=None):
+    """Plot the applied per-axis DNN measurement SD (learned dnn_vel_SD = sigma)
+    over time for one test scenario.
+
+    Parameters
+    ----------
+    sigma_log : list of (time, sd(3), omega_norm)
+        One entry per sequential DNN update (from lc_ins_dvl_real's dnn_sigma_log).
+        `sd` is the SD actually used in R_dnn (constant fallback during warmup, then
+        the learned per-axis sigma). `omega_norm` = ||omega_ib_b|| (rad/s) for the
+        turn-rate overlay.
+    const_sd : float or None
+        The constant dnn_vel_SD; drawn as a reference line for scale.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    t     = np.array([e[0] for e in sigma_log], dtype=float)
+    sd    = np.array([e[1] for e in sigma_log], dtype=float)          # (N, 3)
+    wmag  = np.array([e[2] for e in sigma_log], dtype=float)
+    axis_labels = ['σ North', 'σ East', 'σ Down']
+    axis_colors = ['tab:blue', 'tab:green', 'tab:red']
+
+    suffix = f' — {scenario}' if scenario else ''
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    for i in range(3):
+        ax.plot(t, sd[:, i], color=axis_colors[i], linewidth=1.4, label=axis_labels[i])
+    if const_sd is not None:
+        ax.axhline(const_sd, color='gray', ls='--', lw=1.0,
+                   label=f'constant dnn_vel_SD = {const_sd:g}')
+    ax.set_ylabel('Learned dnn_vel_SD  σ  [m/s]', fontsize=11)
+    ax.set_xlabel('Time [s]', fontsize=11)
+    ax.set_title(f'Learned dnn_vel_SD (σ) over time  [{arch}]{suffix}',
+                 fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+
+    # Turn-rate overlay on a secondary axis: does σ rise where the vehicle turns?
+    ax_w = ax.twinx()
+    ax_w.plot(t, np.rad2deg(wmag), color='darkorange', ls=':', lw=1.0, alpha=0.6,
+              label='‖ω‖ (turn rate)')
+    ax_w.set_ylabel('‖ω_ib_b‖  [deg/s]', fontsize=10, color='darkorange')
+    ax_w.tick_params(axis='y', labelcolor='darkorange')
+
+    # Merge legends from both axes into one box.
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax_w.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='upper right')
+
+    plt.tight_layout()
+    return fig
+
+
 def plot_rmse_over_time(time, pos_rmse_base, vel_rmse_base,
                         pos_rmse_dnn, vel_rmse_dnn,
                         arch='lstm', n_scenarios=0):

@@ -30,6 +30,27 @@ from P_predict import P_predict
 from radii_of_curvature import radii_of_curvature
 
 
+def _dnn_sd_vector(lc_kf_config, sigma):
+    """Per-axis SD (3,) actually used for the DNN velocity pseudo-measurement.
+
+    If use_learned_dnn_sd is on and a per-axis learned sigma is available, use the
+    motion-dependent clip(scale*sigma, min, max); otherwise fall back to the constant
+    scalar dnn_vel_SD broadcast to 3 axes (current behaviour). This is the single
+    source of truth so the plotted SD and the SD inside R are identical.
+    """
+    if lc_kf_config.get('use_learned_dnn_sd', False) and sigma is not None:
+        return np.clip(lc_kf_config.get('dnn_sd_scale', 1.0) * np.asarray(sigma, dtype=float),
+                       lc_kf_config.get('dnn_sd_min', 1e-3),
+                       lc_kf_config.get('dnn_sd_max', 10.0))
+    dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
+    return np.full(3, dnn_sd, dtype=float)
+
+
+def _dnn_meas_R(lc_kf_config, sigma):
+    """Measurement covariance R = diag(sd^2) for the DNN velocity pseudo-measurement."""
+    return np.diag(_dnn_sd_vector(lc_kf_config, sigma) ** 2)
+
+
 def lc_ins_dvl_real(
         in_imu_profile: np.ndarray,
         in_dvl_profile: np.ndarray,
@@ -46,6 +67,7 @@ def lc_ins_dvl_real(
         imu_agg_features: bool = False,
         imu_agg_set: str = 'full',
         dnn_apply_timing: str = 'epoch',
+        dnn_sigma_log=None,
 ) -> Tuple:
     """
     Loosely coupled INS/DVL integration using Extended Kalman Filter.
@@ -250,6 +272,7 @@ def lc_ins_dvl_real(
     # held and applied at the interval midpoint (t_k + interval/2) instead of at
     # the epoch. pending_corr holds the model output; corr_apply_time the target time.
     pending_corr = None
+    pending_sigma = None       # learned per-axis sigma captured with pending_corr
     corr_apply_time = None
 
     # Progress bar
@@ -313,13 +336,25 @@ def lc_ins_dvl_real(
         # 'midway' timing: apply the deferred DNN velocity-only update once the
         # interval midpoint is reached (uses the propagated midpoint P).
         if pending_corr is not None and time >= corr_apply_time:
-            H_dnn = np.zeros((3, 15))
-            H_dnn[0:3, 3:6] = np.eye(3)
-            dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
-            R_dnn = np.eye(3) * dnn_sd ** 2
-            P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
-            est_v_eb_n = est_v_eb_n - (K_dnn @ (-pending_corr))[3:6]
+            if lc_kf_config.get('dnn_apply_mode', 'kalman') == 'inject':
+                # Direct full injection at the interval midpoint; P untouched.
+                est_v_eb_n = est_v_eb_n + pending_corr
+                if dnn_sigma_log is not None and pending_sigma is not None:
+                    dnn_sigma_log.append(
+                        (time, np.asarray(pending_sigma, dtype=float).copy(),
+                         float(np.linalg.norm(meas_omega_ib_b))))
+            else:
+                H_dnn = np.zeros((3, 15))
+                H_dnn[0:3, 3:6] = np.eye(3)
+                sd_vec = _dnn_sd_vector(lc_kf_config, pending_sigma)
+                R_dnn = np.diag(sd_vec ** 2)
+                if dnn_sigma_log is not None:
+                    dnn_sigma_log.append(
+                        (time, sd_vec.copy(), float(np.linalg.norm(meas_omega_ib_b))))
+                P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
+                est_v_eb_n = est_v_eb_n - (K_dnn @ (-pending_corr))[3:6]
             pending_corr = None
+            pending_sigma = None
 
         # Determine whether to update DVL update and run Kalman filter
         if (time - time_last_dvl) >= dvl_config['epoch_interval']:
@@ -420,10 +455,34 @@ def lc_ins_dvl_real(
                         aux_dvl_v_list.append(dvl_v_eb_b.copy())
 
             else:
-                # Sequential path (default, current behavior): DVL update first, then DNN.
+                # Sequential path (default): DVL update first, then a DNN step — except
+                # in 'fuse' mode, where the DNN correction is folded into the single DVL
+                # update (est_v gets the DVL correction + K_v·corr; P shrinks by the DVL
+                # only). compensator.update() is stateful → call it EXACTLY once/epoch:
+                # here for 'fuse', or in the apply block below for 'kalman'/'inject'.
+                fuse = (lc_kf_config.get('dnn_apply_mode', 'kalman') == 'fuse')
+                fuse_corr = None
+                fuse_scale = lc_kf_config.get('dnn_fuse_scale', 1.0)
+                if fuse and compensator is not None:
+                    correction = compensator.update(innovation, v_ekf_pre, euler_pre,
+                                                    meas_f_ib_b, meas_omega_ib_b,
+                                                    imu_agg=imu_agg)
+                    if correction is not None:
+                        fuse_corr = correction[0:3]
+                        # Adaptive per-epoch fuse scale: use the learned gate α when
+                        # enabled and available; else the constant dnn_fuse_scale.
+                        gate = getattr(compensator, 'last_gate', None)
+                        if lc_kf_config.get('use_learned_fuse_scale', False) and gate is not None:
+                            fuse_scale = gate
+                        if dnn_sigma_log is not None:
+                            dnn_sigma_log.append(
+                                (time, np.full(3, fuse_scale, dtype=float),
+                                 float(np.linalg.norm(meas_omega_ib_b))))
                 est_C_b_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix = lc_ekf_epoch(
                     dvl_v_eb_b, tor_s, est_C_b_n, est_v_eb_n, est_L_b, est_lambda_b, est_h_b, est_imu_bias, P_matrix,
-                    meas_f_ib_b, meas_omega_ib_b, lc_kf_config
+                    meas_f_ib_b, meas_omega_ib_b, lc_kf_config,
+                    dnn_corr=fuse_corr,
+                    dnn_corr_scale=fuse_scale
                 )
 
                 # DNN training-data collection (one sample per DVL epoch)
@@ -452,7 +511,9 @@ def lc_ins_dvl_real(
                         aux_dvl_v_list.append(dvl_v_eb_b.copy())
 
                 # DNN velocity compensation (inference mode) — velocity-only.
-                if compensator is not None:
+                # Skipped in 'fuse' mode (already folded into the DVL update above, and
+                # compensator.update() must not be called twice per epoch).
+                if compensator is not None and not fuse:
                     correction = compensator.update(innovation, v_ekf_pre, euler_pre,
                                                     meas_f_ib_b, meas_omega_ib_b,
                                                     imu_agg=imu_agg)
@@ -460,13 +521,30 @@ def lc_ins_dvl_real(
                         vel_corr = correction[0:3]   # multi-task: ignore attitude output
                         if dnn_apply_timing == 'midway':
                             # Defer the velocity-only update to the interval midpoint.
+                            # Capture the learned sigma NOW (with the correction it
+                            # rates) so the deferred update uses the matching R.
                             pending_corr = vel_corr
+                            pending_sigma = getattr(compensator, 'last_sigma', None)
                             corr_apply_time = time + dvl_config['epoch_interval'] / 2.0
+                        elif lc_kf_config.get('dnn_apply_mode', 'kalman') == 'inject':
+                            # Direct full injection: add the DNN correction straight to
+                            # the velocity state; P is left to the DVL only (no DNN
+                            # Kalman update → no P shrink; dnn_sd unused).
+                            est_v_eb_n = est_v_eb_n + vel_corr
+                            sig = getattr(compensator, 'last_sigma', None)
+                            if dnn_sigma_log is not None and sig is not None:
+                                dnn_sigma_log.append(
+                                    (time, np.asarray(sig, dtype=float).copy(),
+                                     float(np.linalg.norm(meas_omega_ib_b))))
                         else:
                             H_dnn = np.zeros((3, 15))
                             H_dnn[0:3, 3:6] = np.eye(3)
-                            dnn_sd = lc_kf_config.get('dnn_vel_SD', lc_kf_config['vel_meas_SD'])
-                            R_dnn = np.eye(3) * dnn_sd ** 2
+                            sd_vec = _dnn_sd_vector(lc_kf_config,
+                                                    getattr(compensator, 'last_sigma', None))
+                            R_dnn = np.diag(sd_vec ** 2)
+                            if dnn_sigma_log is not None:
+                                dnn_sigma_log.append(
+                                    (time, sd_vec.copy(), float(np.linalg.norm(meas_omega_ib_b))))
                             P_matrix, K_dnn = update(P_matrix, H_dnn, R_dnn)
                             # Sign convention matches DVL: delta_z = v_nom - z_meas = -correction
                             x_dnn = K_dnn @ (-vel_corr)

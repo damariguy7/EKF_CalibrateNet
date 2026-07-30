@@ -30,7 +30,9 @@ def lc_ekf_epoch(
         P_matrix_old: np.ndarray,
         meas_f_ib_b: np.ndarray,
         meas_omega_ib_b: np.ndarray,
-        lc_kf_config: Dict[str, float]
+        lc_kf_config: Dict[str, float],
+        dnn_corr: np.ndarray = None,
+        dnn_corr_scale: float = 1.0
 ):
     """
     Implements one cycle of the loosely coupled INS/DVL EKF
@@ -252,6 +254,13 @@ def lc_ekf_epoch(
     delta_z = np.zeros(3)
 
     delta_z[0:3] = est_C_b_to_n_old.T @ est_v_eb_n_old - dvl_v_eb_b
+
+    # 'fuse' mode: fold the DNN velocity correction (NED) into the DVL innovation
+    # (rotated to body). The single Kalman update below then applies both the DVL
+    # and DNN corrections through the DVL gain, and P shrinks by the DVL amount only
+    # (the Joseph update does not depend on delta_z). dnn_corr=None → plain DVL.
+    if dnn_corr is not None:
+        delta_z[0:3] = delta_z[0:3] - dnn_corr_scale * (est_C_b_to_n_old.T @ dnn_corr)
 
     # 9. Update state estimates using (3.24)
     x_est_new = x_est_propagated + K_matrix @ delta_z
