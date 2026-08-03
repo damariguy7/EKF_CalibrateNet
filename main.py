@@ -876,7 +876,17 @@ def main(config):
                 print(f'  Nadav baseline plots saved to {nadav_dir}')
 
 
-if __name__ == '__main__':
+    if config.get('test_data'):
+        return {'scenarios':  list(test_scenario_names),
+                'prmse_base': list(prmse_base_list), 'vrmse_base': list(vrmse_base_list),
+                'prmse_dnn':  {m: list(v) for m, v in prmse_by_mode.items()},
+                'vrmse_dnn':  {m: list(v) for m, v in vrmse_by_mode.items()}}
+    return None
+
+
+def build_configs():
+    """Assemble the full config dict main() expects. Returned so external harnesses
+    (e.g. leave_one_out.py) can reuse the exact tuned config and override per run."""
 
     user_config = {
         # Where to write outputs (plots/, trained_model/)
@@ -902,7 +912,7 @@ if __name__ == '__main__':
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory7', 'trajectory9'],
+        'real_test_files': ['trajectory3', 'trajectory13'],
         # Number of validation trajectories carved from the non-test remainder
         # (the rest go to train). None → default 80/20 split. Clamped to keep ≥1
         # train. With 11 non-test files, 3 → train=8/val=3.
@@ -935,12 +945,14 @@ if __name__ == '__main__':
             'num_layers':    2,
             'batch_size':   32,
             'epochs':      100,
-            'lr':          3e-4,           # lowered from 1e-3 (noisy/early-overfit val)
+            'lr':          1e-5,           # lowered from 1e-3 (noisy/early-overfit val)
+            # 'lr':          3e-4,           # lowered from 1e-3 (noisy/early-overfit val)
             # LR schedule for both DNNs: 'cosine' anneals lr base→~0 over 'epochs'
             # (smoother, lower val minimum); 'none' = constant lr (old behaviour).
-            'lr_scheduler': 'cosine',
+            'lr_scheduler': 'none',
+            # 'lr_scheduler': 'cosine',
             'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
-            'tag':         'traj_7_9',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'tag':         'traj_3_13',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
@@ -992,12 +1004,13 @@ if __name__ == '__main__':
             # of the velocity correction; saved next to the model as *_uncsd.pth.
             # Sequential mode only. To USE it at test, set use_learned_dnn_sd:True in
             # LC_KF_config_real. Requires train_data:True to (re)generate the file.
-            'train_dnn_sd': True,
+            'train_dnn_sd': False,
             # Phase-2 target: 'sigma' (learned per-axis dnn_vel_SD, for 'kalman' mode)
             # or 'fuse_gate' (learned scalar per-epoch fuse scale α for 'fuse' mode,
             # trained toward α* = clip(corr·label/‖corr‖², 0, fuse_gate_max)).
             'unc_target': 'fuse_gate',
             'fuse_gate_max': 0.5,       # upper clamp on the learned α
+            'unc_lr': 3e-4,             # 2nd DNN (fuse-gate) learning rate — set your value here
             # sigma-net hyper-params default to the phase-1 values above; override
             # here if desired: 'unc_arch','unc_hidden_size','unc_epochs','unc_lr'.
             # Input design (ablatable): which groups the sigma-net sees, whether to
@@ -1171,8 +1184,12 @@ if __name__ == '__main__':
 
 
 
-    main({**user_config,
-          'dvl_cfg_sim':  DVL_config_sim,
-          'dvl_cfg_real': DVL_config_real,
-          'kf_cfg_sim':   LC_KF_config_sim,
-          'kf_cfg_real':  LC_KF_config_real})
+    return {**user_config,
+            'dvl_cfg_sim':  DVL_config_sim,
+            'dvl_cfg_real': DVL_config_real,
+            'kf_cfg_sim':   LC_KF_config_sim,
+            'kf_cfg_real':  LC_KF_config_real}
+
+
+if __name__ == '__main__':
+    main(build_configs())
