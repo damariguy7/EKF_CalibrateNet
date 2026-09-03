@@ -912,7 +912,7 @@ def build_configs():
         #     (with the 1-file = test-only shortcut still active).
         'real_files':      [f'trajectory{i}' for i in range(1, 14)],
         # 'real_test_files': ['trajectory4'],
-        'real_test_files': ['trajectory3', 'trajectory13'],
+        'real_test_files': ['trajectory1', 'trajectory4'],
         # Number of validation trajectories carved from the non-test remainder
         # (the rest go to train). None → default 80/20 split. Clamped to keep ≥1
         # train. With 11 non-test files, 3 → train=8/val=3.
@@ -952,7 +952,7 @@ def build_configs():
             'lr_scheduler': 'none',
             # 'lr_scheduler': 'cosine',
             'seed':         42,             # RNG seed for weight init / shuffle / dropout. Same seed + same config => identical model. Change it to sample a different random run
-            'tag':         'traj_3_13',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
+            'tag':         'traj_1_4',              # free-text suffix on the model filename (e.g. 'v2', 'tuned'). Empty = no suffix. The lr token (e.g. 'lr3' for 1e-3) is auto-added before this tag. Do NOT put dnn_vel_SD here — it's not part of the model and is already recorded in the plot-folder name (sd<value>).
             # dnn_mode controls how the DNN is fused with the EKF:
             #   'sequential' — DVL EKF update first, then a second Kalman update with the DNN output.
             #                  Label = true_v_eb_n - est_v_eb_n  (residual AFTER the DVL update).
